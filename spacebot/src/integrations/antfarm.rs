@@ -29,6 +29,12 @@ pub struct TriggerWorkflowRequest {
     pub task_title: String,
     pub task_body: String,
     #[serde(default)]
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
     pub metadata: HashMap<String, String>,
 }
 
@@ -426,12 +432,35 @@ impl AntfarmCliService {
     }
 
     fn build_task_argument(request: &TriggerWorkflowRequest) -> String {
-        let body = request.task_body.trim();
-        if body.is_empty() || body == request.task_title.trim() {
-            return request.task_title.trim().to_string();
+        let mut sections = Vec::new();
+        sections.push(request.task_title.trim().to_string());
+
+        let mut runtime_context = Vec::new();
+        if let Some(repo_path) = request.repo_path.as_deref().map(str::trim)
+            && !repo_path.is_empty()
+        {
+            runtime_context.push(format!("REPO: {repo_path}"));
+        }
+        if let Some(branch) = request.branch.as_deref().map(str::trim)
+            && !branch.is_empty()
+        {
+            runtime_context.push(format!("BRANCH: {branch}"));
+        }
+        if let Some(worktree_path) = request.worktree_path.as_deref().map(str::trim)
+            && !worktree_path.is_empty()
+        {
+            runtime_context.push(format!("WORKTREE: {worktree_path}"));
+        }
+        if !runtime_context.is_empty() {
+            sections.push(runtime_context.join("\n"));
         }
 
-        format!("{}\n\n{}", request.task_title.trim(), body)
+        let body = request.task_body.trim();
+        if !body.is_empty() && body != request.task_title.trim() {
+            sections.push(body.to_string());
+        }
+
+        sections.join("\n\n")
     }
 
     fn resolve_notify_url(&self, request: &TriggerWorkflowRequest) -> Option<String> {

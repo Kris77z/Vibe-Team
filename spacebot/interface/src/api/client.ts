@@ -192,6 +192,30 @@ export interface ConversationWorkflowRunsResponse {
 	runs: ConversationWorkflowRun[];
 }
 
+export interface CreateAntfarmRunRequest {
+	request_id: string;
+	conversation_id: string;
+	workflow_id: string;
+	task_title: string;
+	task_body: string;
+	repo_path?: string;
+	branch?: string;
+	worktree_path?: string;
+	metadata?: Record<string, string>;
+}
+
+export interface CreateAntfarmRunResponse {
+	ok: boolean;
+	run: {
+		ok: boolean;
+		run_id: string;
+		workflow_id: string;
+		status: string;
+		accepted_at: string;
+		run_number?: number | null;
+	};
+}
+
 export type ApiEvent =
 	| InboundMessageEvent
 	| OutboundMessageEvent
@@ -2031,6 +2055,20 @@ export const api = {
 
 	webChatHistory: (agentId: string, sessionId: string, limit = 100) =>
 		fetch(`${API_BASE}/webchat/history?agent_id=${encodeURIComponent(agentId)}&session_id=${encodeURIComponent(sessionId)}&limit=${limit}`),
+	createAntfarmRun: async (
+		request: CreateAntfarmRunRequest,
+	): Promise<CreateAntfarmRunResponse> => {
+		const response = await fetch(`${API_BASE}/antfarm/runs`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(request),
+		});
+		if (!response.ok) {
+			const body = await response.json().catch(() => ({}));
+			throw new Error(body.error || `API error: ${response.status}`);
+		}
+		return response.json() as Promise<CreateAntfarmRunResponse>;
+	},
 	antfarmConversationRuns: (conversationId: string) =>
 		fetchJson<ConversationWorkflowRunsResponse>(`/antfarm/conversations/${encodeURIComponent(conversationId)}/runs`),
 

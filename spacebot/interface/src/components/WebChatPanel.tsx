@@ -4,6 +4,7 @@ import type { ActiveWorker } from "@/hooks/useChannelLiveState";
 import { useLiveContext } from "@/hooks/useLiveContext";
 import { useConversationWorkflowRuns } from "@/hooks/useConversationWorkflowRuns";
 import { Markdown } from "@/components/Markdown";
+import { WorkflowLauncherDialog } from "@/components/WorkflowLauncherDialog";
 import { WorkflowRunsPanel } from "@/components/WorkflowRunsPanel";
 
 interface WebChatPanelProps {
@@ -60,12 +61,14 @@ function FloatingChatInput({
 	onSubmit,
 	disabled,
 	agentId,
+	onOpenWorkflowLauncher,
 }: {
 	value: string;
 	onChange: (value: string) => void;
 	onSubmit: () => void;
 	disabled: boolean;
 	agentId: string;
+	onOpenWorkflowLauncher: () => void;
 }) {
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -102,6 +105,13 @@ function FloatingChatInput({
 			<div className="w-full max-w-2xl pointer-events-auto">
 				<div className="rounded-2xl border border-app-line/50 bg-app-box/40 backdrop-blur-xl shadow-xl transition-colors duration-200 hover:border-app-line/70">
 					<div className="flex items-end gap-2 p-3">
+						<button
+							type="button"
+							onClick={onOpenWorkflowLauncher}
+							className="shrink-0 rounded-lg border border-app-line/60 bg-app-box/60 px-2.5 py-1.5 text-xs font-medium text-ink-dull transition-colors hover:border-app-line hover:bg-app-box hover:text-ink"
+						>
+							Run Workflow
+						</button>
 						<textarea
 							ref={textareaRef}
 							value={value}
@@ -147,6 +157,8 @@ export function WebChatPanel({ agentId }: WebChatPanelProps) {
 	const { sessionId, isSending, error, sendMessage } = useWebChat(agentId);
 	const { liveStates } = useLiveContext();
 	const [input, setInput] = useState("");
+	const [launcherOpen, setLauncherOpen] = useState(false);
+	const [launcherNotice, setLauncherNotice] = useState<string | null>(null);
 	const messagesEndRef = useRef<HTMLDivElement>(null);
 	const { runs: workflowRuns } = useConversationWorkflowRuns(sessionId);
 
@@ -167,6 +179,16 @@ export function WebChatPanel({ agentId }: WebChatPanelProps) {
 		if (!trimmed || isSending) return;
 		setInput("");
 		sendMessage(trimmed);
+	};
+
+	const handleWorkflowStarted = ({
+		runId,
+		workflowId,
+	}: {
+		runId: string;
+		workflowId: string;
+	}) => {
+		setLauncherNotice(`Started ${workflowId} (${runId.slice(0, 8)})`);
 	};
 
 	return (
@@ -218,6 +240,11 @@ export function WebChatPanel({ agentId }: WebChatPanelProps) {
 							{error}
 						</div>
 					)}
+					{launcherNotice && (
+						<div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-4 py-3 text-sm text-emerald-300">
+							{launcherNotice}
+						</div>
+					)}
 					<div ref={messagesEndRef} />
 				</div>
 			</div>
@@ -229,6 +256,14 @@ export function WebChatPanel({ agentId }: WebChatPanelProps) {
 				onSubmit={handleSubmit}
 				disabled={isSending || isTyping}
 				agentId={agentId}
+				onOpenWorkflowLauncher={() => setLauncherOpen(true)}
+			/>
+			<WorkflowLauncherDialog
+				agentId={agentId}
+				conversationId={sessionId}
+				open={launcherOpen}
+				onOpenChange={setLauncherOpen}
+				onStarted={handleWorkflowStarted}
 			/>
 		</div>
 	);

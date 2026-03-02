@@ -6,6 +6,7 @@ import type { ChannelLiveState, ActiveWorker, ActiveBranch } from "@/hooks/useCh
 import { CortexChatPanel } from "@/components/CortexChatPanel";
 import { LiveDuration } from "@/components/LiveDuration";
 import { Markdown } from "@/components/Markdown";
+import { WorkflowLauncherDialog } from "@/components/WorkflowLauncherDialog";
 import { WorkflowRunsPanel } from "@/components/WorkflowRunsPanel";
 import { useConversationWorkflowRuns } from "@/hooks/useConversationWorkflowRuns";
 import { formatTimestamp, platformIcon, platformColor } from "@/lib/format";
@@ -279,6 +280,8 @@ export function ChannelDetail({ agentId, channelId, channel, liveState, onLoadMo
 	const hasActivity = activeWorkerCount > 0 || activeBranchCount > 0;
 	const { runs: workflowRuns } = useConversationWorkflowRuns(channelId);
 	const [cortexOpen, setCortexOpen] = useState(true);
+	const [launcherOpen, setLauncherOpen] = useState(false);
+	const [launcherNotice, setLauncherNotice] = useState<string | null>(null);
 
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const sentinelRef = useRef<HTMLDivElement>(null);
@@ -364,6 +367,14 @@ export function ChannelDetail({ agentId, channelId, channel, liveState, onLoadMo
 								<span className="ml-1 text-tiny text-ink-faint">typing</span>
 							</div>
 						)}
+						<Button
+							onClick={() => setLauncherOpen(true)}
+							variant="outline"
+							size="sm"
+							className="h-8"
+						>
+							Run Workflow
+						</Button>
 						<div className="flex overflow-hidden rounded-md border border-app-line bg-app-darkBox">
 							<Button
 								onClick={() => setCortexOpen(!cortexOpen)}
@@ -381,6 +392,11 @@ export function ChannelDetail({ agentId, channelId, channel, liveState, onLoadMo
 				{/* Timeline — flex-col-reverse keeps scroll pinned to bottom */}
 				<div ref={scrollRef} className="flex flex-1 flex-col-reverse overflow-y-auto">
 					<div className="flex flex-col gap-1 p-6">
+						{launcherNotice && (
+							<div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-4 py-3 text-sm text-emerald-300">
+								{launcherNotice}
+							</div>
+						)}
 						{workflowRuns.length > 0 && <WorkflowRunsPanel runs={workflowRuns} />}
 						{/* Sentinel for infinite scroll — sits above the oldest item */}
 						<div ref={sentinelRef} className="h-px" />
@@ -445,6 +461,15 @@ export function ChannelDetail({ agentId, channelId, channel, liveState, onLoadMo
 					</motion.div>
 				)}
 			</AnimatePresence>
+			<WorkflowLauncherDialog
+				agentId={agentId}
+				conversationId={channelId}
+				open={launcherOpen}
+				onOpenChange={setLauncherOpen}
+				onStarted={({ runId, workflowId }) => {
+					setLauncherNotice(`Started ${workflowId} (${runId.slice(0, 8)})`);
+				}}
+			/>
 		</div>
 	);
 }

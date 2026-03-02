@@ -35,6 +35,9 @@ export type TriggerWorkflowRequest = {
   workflowId: WorkflowId;
   taskTitle: string;
   taskBody: string;
+  repoPath?: string;
+  branch?: string;
+  worktreePath?: string;
   metadata?: Record<string, string>;
 };
 

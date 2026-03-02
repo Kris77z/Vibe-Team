@@ -32,7 +32,14 @@ pub(super) struct CreateAntfarmRunRequest {
     pub conversation_id: String,
     pub workflow_id: String,
     pub task_title: String,
+    #[serde(default)]
     pub task_body: String,
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
     #[serde(default)]
     pub metadata: std::collections::HashMap<String, String>,
 }
@@ -98,6 +105,9 @@ pub(super) async fn create_run(
         workflow_id: request.workflow_id,
         task_title: request.task_title,
         task_body: request.task_body,
+        repo_path: request.repo_path,
+        branch: request.branch,
+        worktree_path: request.worktree_path,
         metadata: request.metadata,
     };
 

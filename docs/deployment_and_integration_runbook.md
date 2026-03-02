@@ -38,6 +38,9 @@
   - 触发 `antfarm workflow run ...`
   - 轮询 Antfarm Dashboard JSON API
   - 在前端显示 workflow 面板
+  - 在 WebChat 面板中通过 `Run Workflow` 直接启动 workflow
+  - 在普通 channel 详情页中通过 `Run Workflow` 直接启动 workflow
+  - 在浏览器中按 agent 保存多个项目 preset，复用 `repo/worktree/workflow` 配置
   - 在刷新后恢复会话绑定的 workflow runs
   - 在 `Spacebot` 重启后恢复已持久化的 run binding，并对未结束 run 重挂 poller
 
@@ -47,6 +50,20 @@
 - `Spacebot` 里“通过自然语言自动触发 workflow”的聊天动作还没正式接入，当前稳定入口是 API
 - `Final result` 的 `changes/tests/review_decision/branch/pr_url` 仍是 best-effort 提取，依赖 Antfarm 最后一步输出格式
 - 当前状态同步是 `polling`，不是 webhook push 或原生 step-level SSE 桥接
+- `Run Workflow` 里的项目 preset 当前只保存在浏览器本地，不会自动同步到其他浏览器或其他机器
+
+---
+
+## 2.1 联调准备结论
+
+到当前阶段，可以把准备联调这件事收敛成下面这句话：
+
+- `OpenClaw` 已是部署机前提
+- `Spacebot` 是最终操作前端
+- `Antfarm` 负责真正执行 workflow
+- 第一次联调优先走 `Spacebot UI -> Run Workflow -> Antfarm -> OpenClaw`
+
+也就是说，后续联调时优先使用 `Spacebot` 现有入口，不再把 curl 当成默认操作方式。
 
 ---
 
@@ -292,8 +309,9 @@ antfarm dashboard start --port 3333
   - `~/.openclaw/antfarm`
   - `~/.openclaw/workspaces/workflows`
 - 如果你设置了 `OPENCLAW_STATE_DIR`，这些目录会跟着改
-- `Antfarm` 当前工作流大量依赖 prompt 中的 `REPO` 信息
-- `Spacebot -> Antfarm` 触发接口当前没有独立 `repo_path` 字段，所以你要把 repo 路径明确写进任务正文
+- `Antfarm` 当前工作流仍大量依赖 prompt 中的 `REPO` / `BRANCH` 信息
+- `Spacebot -> Antfarm` 现在已有独立的 `repo_path` / `branch` / `worktree_path` 字段
+- 当前 launcher 会把这些结构化字段自动展开成兼容现有 workflow 的任务正文
 
 ---
 
@@ -512,7 +530,9 @@ curl -X POST http://127.0.0.1:19898/api/antfarm/runs \
     "conversation_id": "portal:chat:pm",
     "workflow_id": "feature-dev",
     "task_title": "为 target-project 增加签到功能",
-    "task_body": "REPO: '"$TARGET_PROJECT"'\nBRANCH: feature/checkin\n需求：实现用户连续签到、断签重置、积分累加、最小可验证测试。",
+    "task_body": "需求：实现用户连续签到、断签重置、积分累加、最小可验证测试。",
+    "repo_path": "'"$TARGET_PROJECT"'",
+    "branch": "feature/checkin",
     "metadata": {}
   }'
 ```
@@ -520,8 +540,8 @@ curl -X POST http://127.0.0.1:19898/api/antfarm/runs \
 说明：
 
 - `conversation_id` 这里用 `portal:chat:<agent_id>`，其中 `pm` 要替换成你真实的 agent id
-- 当前接口没有单独的 `repo_path` 字段，所以 `task_body` 里必须显式写 `REPO: /absolute/path`
-- 这是当前实现的现实约束，不要省略
+- `repo_path` 和 `branch` 现在建议用独立字段传
+- 当前 launcher 会自动把这些字段转换成兼容 Antfarm workflow 的 `REPO:` / `BRANCH:` 文本上下文
 
 预期：
 
@@ -555,6 +575,37 @@ curl http://127.0.0.1:19898/api/antfarm/runs/<run_id>/result
 - 当前会话页面里是否出现 workflow 面板
 - 状态是否随 run 变化而更新
 
+### 11.5 第五步：改用 Spacebot UI 做真实联调
+
+API smoke test 通过后，不要继续长期停留在 curl 模式，直接切到 `Spacebot` 主前端。
+
+当前 UI 入口已经有两处：
+
+- `WebChat` 页面中的 `Run Workflow`
+- 普通 `channel` 详情页右上角的 `Run Workflow`
+
+这两个入口都支持填写：
+
+- `workflow_id`
+- `repo_path`
+- `branch`
+- `worktree_path`
+- `task_title`
+- `task_body`
+
+并且已经支持按 `agent` 保存多个项目 preset。
+
+推荐操作方式：
+
+1. 先在 `Run Workflow` dialog 中把目标项目保存成一个 preset
+2. 之后联调只需要选择 preset
+3. 每次只改：
+   - `task_title`
+   - `task_body`
+   - 如有必要，改 `branch`
+
+这样可以明显减少联调时重复填路径和 workflow id 的错误率。
+
 ---
 
 ## 12. 前端联调检查点
@@ -573,6 +624,8 @@ curl http://127.0.0.1:19898/api/antfarm/runs/<run_id>/result
 - run 结束后能展开 terminal detail
 - 刷新页面后，当前 conversation 还能恢复已绑定的 workflow runs
 - 重启 `Spacebot` 进程后，已持久化 binding 还能恢复
+- `Run Workflow` dialog 中的 preset 能被正常保存、切换、更新、删除
+- `Custom draft` 模式下，未保存的路径输入不会因为误关弹窗而丢失
 
 如果这些都成立，就不要继续打磨 UI，优先转到真实业务 workflow 联调。
 
@@ -667,6 +720,12 @@ antfarm workflow run feature-dev "REPO: $TARGET_PROJECT
 curl http://127.0.0.1:19898/api/antfarm/conversations/portal:chat:pm/runs
 ```
 
+如果是从 UI 发起的 workflow，但页面没有显示，先再确认：
+
+- 当前触发入口是不是对应当前 conversation
+- `Run Workflow` dialog 提交后是否已经显示启动提示
+- SSE 是否已经收到 `workflow_run_started`
+
 ### 14.5 页面刷新后 workflow 面板丢失
 
 先区分两种情况：
@@ -684,11 +743,79 @@ curl http://127.0.0.1:19898/api/antfarm/conversations/portal:chat:pm/runs
 - `conversation_id` 是否可解析到 agent DB
 - `workflow_run_bindings` 表里是否有记录
 
+### 14.6 浏览器里找不到之前保存的项目 preset
+
+原因通常是：
+
+- 换了浏览器
+- 换了浏览器 profile
+- 清理了 localStorage
+
+当前实现里：
+
+- preset 是浏览器本地保存
+- 不是 `Spacebot` 后端配置
+- 不是部署机全局共享配置
+
+所以这不是后端丢数据，而是当前设计边界
+
 ---
 
-## 15. 数据落点
+## 15. 第一次真实项目联调建议
 
-### 15.1 OpenClaw / Antfarm
+第一次对真实目标项目联调时，不要直接上大需求。
+
+推荐三步：
+
+1. `smoke run`
+2. `最小改动 run`
+3. `真实业务 run`
+
+### A. smoke run
+
+目标：
+
+- 验证 `Spacebot UI -> Antfarm -> OpenClaw` 全链路
+- 不追求真实产出
+
+建议任务：
+
+- 读取 repo
+- 识别技术栈
+- 建立分支
+- 跑 baseline build/test
+
+### B. 最小改动 run
+
+目标：
+
+- 验证 workflow 不只是能启动，还能完成一次实际代码修改
+
+建议任务：
+
+- 改一个低风险文案
+- 或补一个很小的非业务逻辑测试
+- 或新增一个最小开发脚本
+
+要求：
+
+- 改动范围可控
+- 容易回滚
+- 容易判断成功失败
+
+### C. 真实业务 run
+
+目标：
+
+- 验证这套方案能否支撑真实需求交付
+
+这一步再开始使用真正的 feature 需求。
+
+---
+
+## 16. 数据落点
+
+### 16.1 OpenClaw / Antfarm
 
 默认：
 
@@ -701,7 +828,7 @@ curl http://127.0.0.1:19898/api/antfarm/conversations/portal:chat:pm/runs
 - `OPENCLAW_STATE_DIR`
 - `OPENCLAW_CONFIG_PATH`
 
-### 15.2 Spacebot
+### 16.2 Spacebot
 
 默认：
 
@@ -715,7 +842,7 @@ curl http://127.0.0.1:19898/api/antfarm/conversations/portal:chat:pm/runs
 
 - `SPACEBOT_DIR`
 
-### 15.3 本次新增的 workflow binding 持久化
+### 16.3 本次新增的 workflow binding 持久化
 
 `Spacebot` 会把 workflow run binding 落到各 agent SQLite 中的：
 
@@ -728,9 +855,9 @@ curl http://127.0.0.1:19898/api/antfarm/conversations/portal:chat:pm/runs
 
 ---
 
-## 16. 升级与重启建议
+## 17. 升级与重启建议
 
-### 16.1 重启顺序
+### 17.1 重启顺序
 
 建议：
 
@@ -744,7 +871,7 @@ curl http://127.0.0.1:19898/api/antfarm/conversations/portal:chat:pm/runs
 - `Spacebot` 启动时会尝试恢复已持久化的 workflow bindings
 - 如果此时 Dashboard 不可用，未结束 run 的恢复与重挂 poller 会不完整
 
-### 16.2 升级 Antfarm
+### 17.2 升级 Antfarm
 
 在 `antfarm/` 目录：
 
@@ -754,7 +881,7 @@ npm run build
 antfarm install
 ```
 
-### 16.3 升级 Spacebot
+### 17.3 升级 Spacebot
 
 在 `spacebot/interface/`：
 
@@ -771,17 +898,19 @@ cargo build --release
 
 ---
 
-## 17. 已知注意事项
+## 18. 已知注意事项
 
 1. 当前 `feature-dev` workflow 仍是单 repo 多角色流水线，不是严格前后端物理隔离版。
-2. 当前接口还没有独立的 `repo_path` 参数，repo 路径必须明确写进任务正文。
+2. 当前接口已有独立的 `repo_path` / `branch` / `worktree_path` 参数，但 Antfarm workflow 本身仍依赖这些信息最终以文本上下文形式出现。
 3. 当前最终结果提取依赖 Antfarm 最后完成步骤的输出格式，严格结构化产物还需要后续继续规范。
 4. 当前 workflow 更新依赖 polling，不是 Dashboard 主动推送。
 5. 当前 `Spacebot` 里的 workflow 入口已经足够支撑联调，但不建议继续先做 UI 深挖，优先做真实部署验证。
+6. 当前项目 preset 是浏览器本地能力，不是后端共享配置。
+7. 如果你在部署机上换浏览器测试，需要重新建立 preset。
 
 ---
 
-## 18. 推荐的第一次完整联调脚本
+## 19. 推荐的第一次完整联调脚本
 
 如果你只想跑最短路径，按这个顺序即可：
 
@@ -846,7 +975,9 @@ curl -X POST http://127.0.0.1:19898/api/antfarm/runs \
     "conversation_id": "portal:chat:pm",
     "workflow_id": "feature-dev",
     "task_title": "做一次 workflow 集成联调",
-    "task_body": "REPO: '"$TARGET_PROJECT"'\nBRANCH: chore/antfarm-smoke\n需求：只做最小 smoke run，验证 Spacebot -> Antfarm -> OpenClaw 主链路。",
+    "task_body": "需求：只做最小 smoke run，验证 Spacebot -> Antfarm -> OpenClaw 主链路。",
+    "repo_path": "'"$TARGET_PROJECT"'",
+    "branch": "chore/antfarm-smoke",
     "metadata": {}
   }'
 ```
@@ -858,3 +989,21 @@ http://127.0.0.1:19898
 ```
 
 到这里如果你能看到 workflow 状态变化，这条链就已经基本打通了。
+
+---
+
+## 20. 联调前最终检查表
+
+开始真实联调前，逐项确认：
+
+- `OpenClaw` 在部署机已可用
+- `Antfarm Dashboard` 可访问
+- `Spacebot` 页面可打开
+- `Spacebot` 已配置真实 `SPACEBOT_ANTFARM_DASHBOARD_URL`
+- `Spacebot` 没有开启 `SPACEBOT_ENABLE_ANTFARM_MOCK`
+- 目标项目路径是绝对路径
+- 目标项目有明确可写分支策略
+- 至少有一个可用的 `Run Workflow` preset
+- 先跑 `smoke run`，不要直接跑大需求
+
+如果这 9 项都满足，就可以开始第一次真实项目联调。
