@@ -1,0 +1,25 @@
+/target
+.DS_Store
+.fastembed_cache
+
+# Interface
+interface/node_modules/
+interface/dist/
+
+.idea
+list/
+agents/
+
+# Nix
+result/
+.direnv/
+
+# Claude Code - Fichiers propriétaires (auto-généré)
+.claude/
+CLAUDE.md
+.claude-context
+.claude-memory
+.claude-decisions
+docs/phases/
+docs/specs/
+PROJECT-STATUS.md

@@ -1,0 +1,5 @@
+# Top-level repo metadata backups for previously nested repositories
+.git-metadata-backups/
+
+# macOS
+.DS_Store

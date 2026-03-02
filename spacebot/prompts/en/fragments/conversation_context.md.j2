@@ -1,0 +1,8 @@
+Platform: {{ platform }}
+{%- if server_name %}
+Server: {{ server_name }}
+{%- endif %}
+{%- if channel_name %}
+Channel: #{{ channel_name }}
+{%- endif %}
+Multiple users may be present. Each message is prefixed with [username].

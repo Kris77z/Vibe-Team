@@ -1,0 +1,1714 @@
+//! SpacebotModel: Custom CompletionModel implementation that routes through LlmManager.
+
+use crate::config::{ApiType, ProviderConfig};
+use crate::llm::manager::LlmManager;
+use crate::llm::routing::{
+    self, MAX_FALLBACK_ATTEMPTS, MAX_RETRIES_PER_MODEL, RETRY_BASE_DELAY_MS, RoutingConfig,
+};
+
+use rig::completion::{self, CompletionError, CompletionModel, CompletionRequest, GetTokenUsage};
+use rig::message::{
+    AssistantContent, DocumentSourceKind, Image, Message, MimeType, Text, ToolCall, ToolFunction,
+    UserContent,
+};
+use rig::one_or_many::OneOrMany;
+use rig::streaming::StreamingCompletionResponse;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// Raw provider response. Wraps the JSON so Rig can carry it through.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawResponse {
+    pub body: serde_json::Value,
+}
+
+/// Streaming response placeholder. Streaming will be implemented per-provider
+/// when we wire up SSE parsing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawStreamingResponse {
+    pub body: serde_json::Value,
+}
+
+impl GetTokenUsage for RawStreamingResponse {
+    fn token_usage(&self) -> Option<completion::Usage> {
+        None
+    }
+}
+
+/// Custom completion model that routes through LlmManager.
+///
+/// Optionally holds a RoutingConfig for fallback behavior. When present,
+/// completion() will try fallback models on retriable errors.
+#[derive(Clone)]
+pub struct SpacebotModel {
+    llm_manager: Arc<LlmManager>,
+    model_name: String,
+    provider: String,
+    full_model_name: String,
+    routing: Option<RoutingConfig>,
+    agent_id: Option<String>,
+    process_type: Option<String>,
+}
+
+impl SpacebotModel {
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+    pub fn full_model_name(&self) -> &str {
+        &self.full_model_name
+    }
+
+    /// Attach routing config for fallback behavior.
+    pub fn with_routing(mut self, routing: RoutingConfig) -> Self {
+        self.routing = Some(routing);
+        self
+    }
+
+    /// Attach agent context for per-agent metric labels.
+    pub fn with_context(
+        mut self,
+        agent_id: impl Into<String>,
+        process_type: impl Into<String>,
+    ) -> Self {
+        self.agent_id = Some(agent_id.into());
+        self.process_type = Some(process_type.into());
+        self
+    }
+
+    /// Direct call to the provider (no fallback logic).
+    async fn attempt_completion(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let provider_id = self
+            .full_model_name
+            .split_once('/')
+            .map(|(provider, _)| provider)
+            .unwrap_or("anthropic");
+
+        let provider_config = match provider_id {
+            "anthropic" => self
+                .llm_manager
+                .get_anthropic_provider()
+                .await
+                .map_err(|e| CompletionError::ProviderError(e.to_string()))?,
+            "openai" => self
+                .llm_manager
+                .get_openai_provider()
+                .await
+                .map_err(|e| CompletionError::ProviderError(e.to_string()))?,
+            "openai-chatgpt" => self
+                .llm_manager
+                .get_openai_chatgpt_provider()
+                .await
+                .map_err(|e| CompletionError::ProviderError(e.to_string()))?,
+            _ => self
+                .llm_manager
+                .get_provider(provider_id)
+                .map_err(|e| CompletionError::ProviderError(e.to_string()))?,
+        };
+
+        match provider_config.api_type {
+            ApiType::Anthropic => self.call_anthropic(request, &provider_config).await,
+            ApiType::OpenAiCompletions => self.call_openai(request, &provider_config).await,
+            ApiType::OpenAiChatCompletions => {
+                let endpoint = format!(
+                    "{}/chat/completions",
+                    provider_config.base_url.trim_end_matches('/')
+                );
+                let display_name = provider_config
+                    .name
+                    .as_deref()
+                    .unwrap_or("OpenAI-compatible provider");
+                self.call_openai_compatible_with_optional_auth(
+                    request,
+                    display_name,
+                    &endpoint,
+                    Some(provider_config.api_key.clone()),
+                    &[],
+                )
+                .await
+            }
+            ApiType::KiloGateway => {
+                let endpoint = format!(
+                    "{}/chat/completions",
+                    provider_config.base_url.trim_end_matches('/')
+                );
+                self.call_openai_compatible_with_optional_auth(
+                    request,
+                    "Kilo Gateway",
+                    &endpoint,
+                    Some(provider_config.api_key.clone()),
+                    &[
+                        ("HTTP-Referer", "https://github.com/spacedriveapp/spacebot"),
+                        ("X-Title", "spacebot"),
+                    ],
+                )
+                .await
+            }
+            ApiType::OpenAiResponses => self.call_openai_responses(request, &provider_config).await,
+            ApiType::Gemini => {
+                self.call_openai_compatible(request, "Google Gemini", &provider_config)
+                    .await
+            }
+        }
+    }
+
+    /// Try a model with retries and exponential backoff on transient errors.
+    ///
+    /// Returns `Ok(response)` on success, or `Err((last_error, was_rate_limit))`
+    /// after exhausting retries. `was_rate_limit` indicates the final failure was
+    /// a 429/rate-limit (as opposed to a timeout or server error), so the caller
+    /// can decide whether to record cooldown.
+    async fn attempt_with_retries(
+        &self,
+        model_name: &str,
+        request: &CompletionRequest,
+    ) -> Result<completion::CompletionResponse<RawResponse>, (CompletionError, bool)> {
+        let model = if model_name == self.full_model_name {
+            self.clone()
+        } else {
+            SpacebotModel::make(&self.llm_manager, model_name)
+        };
+
+        let mut last_error = None;
+        for attempt in 0..MAX_RETRIES_PER_MODEL {
+            if attempt > 0 {
+                let delay_ms = RETRY_BASE_DELAY_MS * 2u64.pow((attempt - 1) as u32);
+                tracing::debug!(
+                    model = %model_name,
+                    attempt = attempt + 1,
+                    delay_ms,
+                    "retrying after backoff"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+
+            match model.attempt_completion(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let error_str = error.to_string();
+                    if !routing::is_retriable_error(&error_str) {
+                        // Non-retriable (auth error, bad request, etc) — bail immediately
+                        return Err((error, false));
+                    }
+                    tracing::warn!(
+                        model = %model_name,
+                        attempt = attempt + 1,
+                        %error,
+                        "retriable error"
+                    );
+                    last_error = Some(error_str);
+                }
+            }
+        }
+
+        let error_str = last_error.unwrap_or_default();
+        let was_rate_limit = routing::is_rate_limit_error(&error_str);
+        Err((
+            CompletionError::ProviderError(format!(
+                "{model_name} failed after {MAX_RETRIES_PER_MODEL} attempts: {error_str}"
+            )),
+            was_rate_limit,
+        ))
+    }
+}
+
+impl CompletionModel for SpacebotModel {
+    type Response = RawResponse;
+    type StreamingResponse = RawStreamingResponse;
+    type Client = Arc<LlmManager>;
+
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        let full_name = model.into();
+
+        // OpenRouter model names have the form "openrouter/provider/model",
+        // so split on the first "/" only and keep the rest as the model name.
+        let (provider, model_name) = if let Some(rest) = full_name.strip_prefix("openrouter/") {
+            ("openrouter".to_string(), rest.to_string())
+        } else if let Some((p, m)) = full_name.split_once('/') {
+            (p.to_string(), m.to_string())
+        } else {
+            ("anthropic".to_string(), full_name.clone())
+        };
+
+        let full_model_name = format!("{provider}/{model_name}");
+
+        Self {
+            llm_manager: client.clone(),
+            model_name,
+            provider,
+            full_model_name,
+            routing: None,
+            agent_id: None,
+            process_type: None,
+        }
+    }
+
+    async fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        #[cfg(feature = "metrics")]
+        let start = std::time::Instant::now();
+
+        let result = async move {
+            let Some(routing) = &self.routing else {
+                // No routing config — just call the model directly, no fallback/retry
+                return self.attempt_completion(request).await;
+            };
+
+            let cooldown = routing.rate_limit_cooldown_secs;
+            let fallbacks = routing.get_fallbacks(&self.full_model_name);
+            let mut last_error: Option<CompletionError> = None;
+
+            // Try the primary model (with retries) unless it's in rate-limit cooldown
+            // and we have fallbacks to try instead.
+            let primary_rate_limited = self
+                .llm_manager
+                .is_rate_limited(&self.full_model_name, cooldown)
+                .await;
+
+            let skip_primary = primary_rate_limited && !fallbacks.is_empty();
+
+            if skip_primary {
+                tracing::debug!(
+                    model = %self.full_model_name,
+                    "primary model in rate-limit cooldown, skipping to fallbacks"
+                );
+            } else {
+                match self
+                    .attempt_with_retries(&self.full_model_name, &request)
+                    .await
+                {
+                    Ok(response) => return Ok(response),
+                    Err((error, was_rate_limit)) => {
+                        if was_rate_limit {
+                            self.llm_manager
+                                .record_rate_limit(&self.full_model_name)
+                                .await;
+                        }
+                        if fallbacks.is_empty() {
+                            // No fallbacks — this is the final error
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            model = %self.full_model_name,
+                            "primary model exhausted retries, trying fallbacks"
+                        );
+                        last_error = Some(error);
+                    }
+                }
+            }
+
+            // Try fallback chain, each with their own retry loop
+            for (index, fallback_name) in fallbacks.iter().take(MAX_FALLBACK_ATTEMPTS).enumerate() {
+                if self
+                    .llm_manager
+                    .is_rate_limited(fallback_name, cooldown)
+                    .await
+                {
+                    tracing::debug!(
+                        fallback = %fallback_name,
+                        "fallback model in cooldown, skipping"
+                    );
+                    continue;
+                }
+
+                match self.attempt_with_retries(fallback_name, &request).await {
+                    Ok(response) => {
+                        tracing::info!(
+                            original = %self.full_model_name,
+                            fallback = %fallback_name,
+                            attempt = index + 1,
+                            "fallback model succeeded"
+                        );
+                        return Ok(response);
+                    }
+                    Err((error, was_rate_limit)) => {
+                        if was_rate_limit {
+                            self.llm_manager.record_rate_limit(fallback_name).await;
+                        }
+                        tracing::warn!(
+                            fallback = %fallback_name,
+                            "fallback model exhausted retries, continuing chain"
+                        );
+                        last_error = Some(error);
+                    }
+                }
+            }
+
+            Err(last_error.unwrap_or_else(|| {
+                CompletionError::ProviderError("all models in fallback chain failed".into())
+            }))
+        }
+        .await;
+
+        #[cfg(feature = "metrics")]
+        {
+            let elapsed = start.elapsed().as_secs_f64();
+            let agent_label = self.agent_id.as_deref().unwrap_or("unknown");
+            let tier_label = self.process_type.as_deref().unwrap_or("unknown");
+            let metrics = crate::telemetry::Metrics::global();
+            metrics
+                .llm_requests_total
+                .with_label_values(&[agent_label, &self.full_model_name, tier_label])
+                .inc();
+            metrics
+                .llm_request_duration_seconds
+                .with_label_values(&[agent_label, &self.full_model_name, tier_label])
+                .observe(elapsed);
+
+            if let Ok(ref response) = result {
+                let usage = &response.usage;
+                if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                    metrics
+                        .llm_tokens_total
+                        .with_label_values(&[
+                            agent_label,
+                            &self.full_model_name,
+                            tier_label,
+                            "input",
+                        ])
+                        .inc_by(usage.input_tokens);
+                    metrics
+                        .llm_tokens_total
+                        .with_label_values(&[
+                            agent_label,
+                            &self.full_model_name,
+                            tier_label,
+                            "output",
+                        ])
+                        .inc_by(usage.output_tokens);
+                    if usage.cached_input_tokens > 0 {
+                        metrics
+                            .llm_tokens_total
+                            .with_label_values(&[
+                                agent_label,
+                                &self.full_model_name,
+                                tier_label,
+                                "cached_input",
+                            ])
+                            .inc_by(usage.cached_input_tokens);
+                    }
+
+                    let cost = crate::llm::pricing::estimate_cost(
+                        &self.full_model_name,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cached_input_tokens,
+                    );
+                    if cost > 0.0 {
+                        metrics
+                            .llm_estimated_cost_dollars
+                            .with_label_values(&[agent_label, &self.full_model_name, tier_label])
+                            .inc_by(cost);
+                    }
+                }
+            }
+
+            if let Err(ref error) = result {
+                let error_type = match error {
+                    rig::completion::CompletionError::ProviderError(msg) => {
+                        if msg.contains("rate") || msg.contains("429") {
+                            "rate_limit"
+                        } else if msg.contains("timeout") {
+                            "timeout"
+                        } else if msg.contains("context") || msg.contains("too long") {
+                            "context_overflow"
+                        } else {
+                            "provider_error"
+                        }
+                    }
+                    _ => "other",
+                };
+                metrics
+                    .process_errors_total
+                    .with_label_values(&[agent_label, tier_label, error_type])
+                    .inc();
+            }
+        }
+
+        result
+    }
+
+    async fn stream(
+        &self,
+        _request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<RawStreamingResponse>, CompletionError> {
+        Err(CompletionError::ProviderError(
+            "streaming not yet implemented".into(),
+        ))
+    }
+}
+
+impl SpacebotModel {
+    async fn call_anthropic(
+        &self,
+        request: CompletionRequest,
+        provider_config: &ProviderConfig,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let api_key = provider_config.api_key.as_str();
+
+        let effort = self
+            .routing
+            .as_ref()
+            .map(|r| r.thinking_effort_for_model(&self.model_name))
+            .unwrap_or("auto");
+        let anthropic_request = crate::llm::anthropic::build_anthropic_request(
+            self.llm_manager.http_client(),
+            api_key,
+            &provider_config.base_url,
+            &self.model_name,
+            &request,
+            effort,
+            provider_config.use_bearer_auth,
+        );
+
+        let is_oauth =
+            anthropic_request.auth_path == crate::llm::anthropic::AnthropicAuthPath::OAuthToken;
+        let original_tools = anthropic_request.original_tools;
+
+        let response = anthropic_request
+            .builder
+            .send()
+            .await
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            CompletionError::ProviderError(format!("failed to read response body: {e}"))
+        })?;
+
+        let response_body: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| {
+                CompletionError::ProviderError(format!(
+                    "Anthropic response ({status}) is not valid JSON: {e}\nBody: {}",
+                    truncate_body(&response_text)
+                ))
+            })?;
+
+        if !status.is_success() {
+            let message = response_body["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            return Err(CompletionError::ProviderError(format!(
+                "Anthropic API error ({status}): {message}"
+            )));
+        }
+
+        let mut completion = parse_anthropic_response(response_body)?;
+
+        // Reverse-map tool names when using OAuth (Claude Code canonical → original)
+        if is_oauth && !original_tools.is_empty() {
+            reverse_map_tool_names(&mut completion, &original_tools);
+        }
+
+        Ok(completion)
+    }
+
+    async fn call_openai(
+        &self,
+        request: CompletionRequest,
+        provider_config: &ProviderConfig,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let api_key = provider_config.api_key.as_str();
+
+        let mut messages = Vec::new();
+
+        if let Some(preamble) = &request.preamble {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": preamble,
+            }));
+        }
+
+        messages.extend(convert_messages_to_openai(&request.chat_history));
+
+        let api_model_name = self.remap_model_name_for_api();
+        let mut body = serde_json::json!({
+            "model": api_model_name,
+            "messages": messages,
+        });
+
+        if let Some(max_tokens) = request.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+
+        if !request.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(tools);
+        }
+
+        let chat_completions_url = format!(
+            "{}/v1/chat/completions",
+            provider_config.base_url.trim_end_matches('/')
+        );
+        let openai_account_id = if self.provider == "openai-chatgpt" {
+            self.llm_manager.get_openai_account_id().await
+        } else {
+            None
+        };
+
+        let mut request_builder = self
+            .llm_manager
+            .http_client()
+            .post(&chat_completions_url)
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("content-type", "application/json");
+        if let Some(account_id) = openai_account_id {
+            request_builder = request_builder.header("chatgpt-account-id", account_id);
+        }
+
+        // Kimi endpoints require a specific user-agent header.
+        if chat_completions_url.contains("kimi.com") || chat_completions_url.contains("moonshot.ai")
+        {
+            request_builder = request_builder.header("user-agent", "KimiCLI/1.3");
+        }
+
+        let response = request_builder
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            CompletionError::ProviderError(format!("failed to read response body: {e}"))
+        })?;
+
+        let response_body: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| {
+                CompletionError::ProviderError(format!(
+                    "OpenAI response ({status}) is not valid JSON: {e}\nBody: {}",
+                    truncate_body(&response_text)
+                ))
+            })?;
+
+        if !status.is_success() {
+            let message = response_body["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            return Err(CompletionError::ProviderError(format!(
+                "OpenAI API error ({status}): {message}"
+            )));
+        }
+
+        parse_openai_response(response_body, "OpenAI")
+    }
+
+    async fn call_openai_responses(
+        &self,
+        request: CompletionRequest,
+        provider_config: &ProviderConfig,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let base_url = provider_config.base_url.trim_end_matches('/');
+        let is_chatgpt_codex = self.provider == "openai-chatgpt";
+        let responses_url = if is_chatgpt_codex {
+            format!("{base_url}/responses")
+        } else {
+            format!("{base_url}/v1/responses")
+        };
+        let api_key = provider_config.api_key.as_str();
+
+        let input = convert_messages_to_openai_responses(&request.chat_history);
+
+        let api_model_name = self.remap_model_name_for_api();
+        let mut body = serde_json::json!({
+            "model": api_model_name,
+            "input": input,
+        });
+
+        if let Some(preamble) = &request.preamble {
+            body["instructions"] = serde_json::json!(preamble);
+        } else if is_chatgpt_codex {
+            body["instructions"] = serde_json::json!(
+                "You are Spacebot. Follow instructions exactly and respond concisely."
+            );
+        }
+
+        if !is_chatgpt_codex && let Some(max_tokens) = request.max_tokens {
+            body["max_output_tokens"] = serde_json::json!(max_tokens);
+        }
+
+        if !is_chatgpt_codex && let Some(temperature) = request.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+
+        if is_chatgpt_codex {
+            body["store"] = serde_json::json!(false);
+            body["stream"] = serde_json::json!(true);
+        }
+
+        if !request.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|tool_definition| {
+                    serde_json::json!({
+                        "type": "function",
+                        "name": tool_definition.name,
+                        "description": tool_definition.description,
+                        "parameters": tool_definition.parameters,
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(tools);
+        }
+
+        let openai_account_id = if self.provider == "openai-chatgpt" {
+            self.llm_manager.get_openai_account_id().await
+        } else {
+            None
+        };
+
+        let mut request_builder = self
+            .llm_manager
+            .http_client()
+            .post(&responses_url)
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("content-type", "application/json");
+        if let Some(account_id) = openai_account_id {
+            request_builder = request_builder.header("ChatGPT-Account-Id", account_id);
+        }
+        if is_chatgpt_codex {
+            request_builder = request_builder
+                .header("originator", "opencode")
+                .header(
+                    "session_id",
+                    format!("spacebot-{}", chrono::Utc::now().timestamp()),
+                )
+                .header(
+                    "user-agent",
+                    format!("spacebot/{}", env!("CARGO_PKG_VERSION")),
+                );
+        }
+
+        let response = request_builder
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            CompletionError::ProviderError(format!("failed to read response body: {e}"))
+        })?;
+
+        if !status.is_success() {
+            let message = parse_openai_error_message(&response_text)
+                .unwrap_or_else(|| "unknown error".to_string());
+            return Err(CompletionError::ProviderError(format!(
+                "OpenAI Responses API error ({status}): {message}"
+            )));
+        }
+
+        let response_body: serde_json::Value = if is_chatgpt_codex {
+            parse_openai_responses_sse_response(&response_text)?
+        } else {
+            serde_json::from_str(&response_text).map_err(|e| {
+                CompletionError::ProviderError(format!(
+                    "OpenAI Responses API response ({status}) is not valid JSON: {e}\nBody: {}",
+                    truncate_body(&response_text)
+                ))
+            })?
+        };
+
+        parse_openai_responses_response(response_body)
+    }
+
+    /// Generic OpenAI-compatible API call.
+    /// Used by providers that implement the OpenAI chat completions format.
+    #[allow(dead_code)]
+    async fn call_openai_compatible(
+        &self,
+        request: CompletionRequest,
+        provider_display_name: &str,
+        provider_config: &ProviderConfig,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let base_url = provider_config.base_url.trim_end_matches('/');
+        let endpoint_path = match provider_config.api_type {
+            ApiType::OpenAiCompletions | ApiType::OpenAiResponses => "/v1/chat/completions",
+            ApiType::OpenAiChatCompletions | ApiType::Gemini => "/chat/completions",
+            ApiType::Anthropic => {
+                return Err(CompletionError::ProviderError(format!(
+                    "{provider_display_name} is configured with anthropic API type, but this call expects an OpenAI-compatible API"
+                )));
+            }
+            _ => {
+                return Err(CompletionError::ProviderError(format!(
+                    "{provider_display_name} uses API type {:?} which does not support OpenAI-compatible calls",
+                    provider_config.api_type
+                )));
+            }
+        };
+        let endpoint = format!("{base_url}{endpoint_path}");
+        let api_key = provider_config.api_key.as_str();
+
+        let mut messages = Vec::new();
+
+        if let Some(preamble) = &request.preamble {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": preamble,
+            }));
+        }
+
+        messages.extend(convert_messages_to_openai(&request.chat_history));
+
+        let mut body = serde_json::json!({
+            "model": self.model_name,
+            "messages": messages,
+        });
+
+        if let Some(max_tokens) = request.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+
+        if !request.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(tools);
+        }
+
+        let response = self
+            .llm_manager
+            .http_client()
+            .post(&endpoint)
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            CompletionError::ProviderError(format!("failed to read response body: {e}"))
+        })?;
+
+        let response_body: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| {
+                CompletionError::ProviderError(format!(
+                    "{provider_display_name} response ({status}) is not valid JSON: {e}\nBody: {}",
+                    truncate_body(&response_text)
+                ))
+            })?;
+
+        if !status.is_success() {
+            let message = response_body["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            return Err(CompletionError::ProviderError(format!(
+                "{provider_display_name} API error ({status}): {message}"
+            )));
+        }
+
+        parse_openai_response(response_body, provider_display_name)
+    }
+
+    /// Remap model name for providers that require a different format in API calls.
+    fn remap_model_name_for_api(&self) -> String {
+        remap_model_name_for_api(&self.provider, &self.model_name)
+    }
+
+    /// Generic OpenAI-compatible API call with optional bearer auth.
+    async fn call_openai_compatible_with_optional_auth(
+        &self,
+        request: CompletionRequest,
+        provider_display_name: &str,
+        endpoint: &str,
+        api_key: Option<String>,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        let mut messages = Vec::new();
+
+        if let Some(preamble) = &request.preamble {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": preamble,
+            }));
+        }
+
+        messages.extend(convert_messages_to_openai(&request.chat_history));
+
+        let api_model_name = self.remap_model_name_for_api();
+        let mut body = serde_json::json!({
+            "model": api_model_name,
+            "messages": messages,
+        });
+
+        if let Some(max_tokens) = request.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+
+        if !request.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(tools);
+        }
+
+        let mut request_builder = self.llm_manager.http_client().post(endpoint);
+
+        for (header_name, header_value) in extra_headers {
+            request_builder = request_builder.header(*header_name, *header_value);
+        }
+
+        if let Some(api_key) = api_key {
+            request_builder = request_builder.header("authorization", format!("Bearer {api_key}"));
+        }
+
+        let response = request_builder
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            CompletionError::ProviderError(format!("failed to read response body: {e}"))
+        })?;
+
+        let response_body: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| {
+                CompletionError::ProviderError(format!(
+                    "{provider_display_name} response ({status}) is not valid JSON: {e}\nBody: {}",
+                    truncate_body(&response_text)
+                ))
+            })?;
+
+        if !status.is_success() {
+            let message = response_body["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            return Err(CompletionError::ProviderError(format!(
+                "{provider_display_name} API error ({status}): {message}"
+            )));
+        }
+
+        parse_openai_response(response_body, provider_display_name)
+    }
+}
+// --- Helpers ---
+
+/// Reverse-map Claude Code canonical tool names back to the original names
+/// from the request's tool definitions.
+fn reverse_map_tool_names(
+    completion: &mut completion::CompletionResponse<RawResponse>,
+    original_tools: &[(String, String)],
+) {
+    for content in completion.choice.iter_mut() {
+        if let AssistantContent::ToolCall(tc) = content {
+            tc.function.name =
+                crate::llm::anthropic::from_claude_code_name(&tc.function.name, original_tools);
+        }
+    }
+}
+
+fn tool_result_content_to_string(content: &OneOrMany<rig::message::ToolResultContent>) -> String {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            rig::message::ToolResultContent::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// --- Message conversion ---
+
+pub fn convert_messages_to_anthropic(messages: &OneOrMany<Message>) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content } => {
+                let parts: Vec<serde_json::Value> = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => (!t.text.trim().is_empty())
+                            .then(|| serde_json::json!({"type": "text", "text": t.text})),
+                        UserContent::Image(image) => convert_image_anthropic(image),
+                        UserContent::ToolResult(result) => Some(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": result.id,
+                            "content": tool_result_content_to_string(&result.content),
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                (!parts.is_empty()).then(|| serde_json::json!({"role": "user", "content": parts}))
+            }
+            Message::Assistant { content, .. } => {
+                let parts: Vec<serde_json::Value> = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantContent::Text(t) => (!t.text.trim().is_empty())
+                            .then(|| serde_json::json!({"type": "text", "text": t.text})),
+                        AssistantContent::ToolCall(tc) => Some(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.function.name,
+                            "input": tc.function.arguments,
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                (!parts.is_empty())
+                    .then(|| serde_json::json!({"role": "assistant", "content": parts}))
+            }
+        })
+        .collect()
+}
+
+fn convert_messages_to_openai(messages: &OneOrMany<Message>) -> Vec<serde_json::Value> {
+    let mut result = Vec::new();
+
+    for message in messages.iter() {
+        match message {
+            Message::User { content } => {
+                // Separate tool results (they need their own messages) from content parts
+                let mut content_parts: Vec<serde_json::Value> = Vec::new();
+                let mut tool_results: Vec<serde_json::Value> = Vec::new();
+
+                for item in content.iter() {
+                    match item {
+                        UserContent::Text(t) => {
+                            content_parts.push(serde_json::json!({
+                                "type": "text",
+                                "text": t.text,
+                            }));
+                        }
+                        UserContent::Image(image) => {
+                            if let Some(part) = convert_image_openai(image) {
+                                content_parts.push(part);
+                            }
+                        }
+                        UserContent::ToolResult(tr) => {
+                            tool_results.push(serde_json::json!({
+                                "role": "tool",
+                                "tool_call_id": tr.id,
+                                "content": tool_result_content_to_string(&tr.content),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !content_parts.is_empty() {
+                    // If there's only one text part and no images, use simple string format
+                    if content_parts.len() == 1 && content_parts[0]["type"] == "text" {
+                        result.push(serde_json::json!({
+                            "role": "user",
+                            "content": content_parts[0]["text"],
+                        }));
+                    } else {
+                        // Mixed content (text + images): use array-of-parts format
+                        result.push(serde_json::json!({
+                            "role": "user",
+                            "content": content_parts,
+                        }));
+                    }
+                }
+
+                result.extend(tool_results);
+            }
+            Message::Assistant { content, .. } => {
+                let mut text_parts = Vec::new();
+                let mut tool_calls = Vec::new();
+
+                for item in content.iter() {
+                    match item {
+                        AssistantContent::Text(t) => {
+                            text_parts.push(t.text.clone());
+                        }
+                        AssistantContent::ToolCall(tc) => {
+                            // OpenAI expects arguments as a JSON string
+                            let args_string = serde_json::to_string(&tc.function.arguments)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            tool_calls.push(serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": args_string,
+                                }
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                let mut msg = serde_json::json!({"role": "assistant"});
+                if !text_parts.is_empty() {
+                    msg["content"] = serde_json::json!(text_parts.join("\n"));
+                }
+                if !tool_calls.is_empty() {
+                    msg["tool_calls"] = serde_json::json!(tool_calls);
+                }
+                result.push(msg);
+            }
+        }
+    }
+
+    result
+}
+
+fn convert_messages_to_openai_responses(messages: &OneOrMany<Message>) -> Vec<serde_json::Value> {
+    let mut result = Vec::new();
+
+    for message in messages.iter() {
+        match message {
+            Message::User { content } => {
+                let mut content_parts = Vec::new();
+
+                for item in content.iter() {
+                    match item {
+                        UserContent::Text(text) => {
+                            content_parts.push(serde_json::json!({
+                                "type": "input_text",
+                                "text": text.text,
+                            }));
+                        }
+                        UserContent::Image(image) => {
+                            if let Some(part) = convert_image_openai_responses(image) {
+                                content_parts.push(part);
+                            }
+                        }
+                        UserContent::ToolResult(tool_result) => {
+                            result.push(serde_json::json!({
+                                "type": "function_call_output",
+                                "call_id": tool_result.id,
+                                "output": tool_result_content_to_string(&tool_result.content),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !content_parts.is_empty() {
+                    result.push(serde_json::json!({
+                        "role": "user",
+                        "content": content_parts,
+                    }));
+                }
+            }
+            Message::Assistant { content, .. } => {
+                let mut text_parts = Vec::new();
+
+                for item in content.iter() {
+                    match item {
+                        AssistantContent::Text(text) => {
+                            text_parts.push(serde_json::json!({
+                                "type": "output_text",
+                                "text": text.text,
+                            }));
+                        }
+                        AssistantContent::ToolCall(tool_call) => {
+                            let arguments = serde_json::to_string(&tool_call.function.arguments)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            result.push(serde_json::json!({
+                                "type": "function_call",
+                                "name": tool_call.function.name,
+                                "arguments": arguments,
+                                "call_id": tool_call.id,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !text_parts.is_empty() {
+                    result.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": text_parts,
+                    }));
+                }
+            }
+        }
+    }
+
+    result
+}
+
+// --- Image conversion helpers ---
+
+/// Convert a rig Image to an Anthropic image content block.
+/// Anthropic format: {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "..."}}
+fn convert_image_anthropic(image: &Image) -> Option<serde_json::Value> {
+    let media_type = image
+        .media_type
+        .as_ref()
+        .map(|mt| mt.to_mime_type())
+        .unwrap_or("image/jpeg");
+
+    match &image.data {
+        DocumentSourceKind::Base64(data) => Some(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            }
+        })),
+        DocumentSourceKind::Url(url) => Some(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": url,
+            }
+        })),
+        _ => None,
+    }
+}
+
+/// Convert a rig Image to an OpenAI image_url content part.
+/// OpenAI/OpenRouter format: {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+fn convert_image_openai(image: &Image) -> Option<serde_json::Value> {
+    let media_type = image
+        .media_type
+        .as_ref()
+        .map(|mt| mt.to_mime_type())
+        .unwrap_or("image/jpeg");
+
+    match &image.data {
+        DocumentSourceKind::Base64(data) => {
+            let data_url = format!("data:{media_type};base64,{data}");
+            Some(serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": data_url }
+            }))
+        }
+        DocumentSourceKind::Url(url) => Some(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": url }
+        })),
+        _ => None,
+    }
+}
+
+fn convert_image_openai_responses(image: &Image) -> Option<serde_json::Value> {
+    let media_type = image
+        .media_type
+        .as_ref()
+        .map(|mime_type| mime_type.to_mime_type())
+        .unwrap_or("image/jpeg");
+
+    match &image.data {
+        DocumentSourceKind::Base64(data) => {
+            let data_url = format!("data:{media_type};base64,{data}");
+            Some(serde_json::json!({
+                "type": "input_image",
+                "image_url": data_url,
+            }))
+        }
+        DocumentSourceKind::Url(url) => Some(serde_json::json!({
+            "type": "input_image",
+            "image_url": url,
+        })),
+        _ => None,
+    }
+}
+
+/// Truncate a response body for error messages to avoid dumping megabytes of HTML.
+fn truncate_body(body: &str) -> &str {
+    let limit = 500;
+    if body.len() <= limit {
+        body
+    } else {
+        &body[..limit]
+    }
+}
+
+// --- Response parsing ---
+
+fn make_tool_call(id: String, name: String, arguments: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id,
+        call_id: None,
+        function: ToolFunction {
+            name: name.trim().to_string(),
+            arguments,
+        },
+        signature: None,
+        additional_params: None,
+    }
+}
+
+fn parse_anthropic_response(
+    body: serde_json::Value,
+) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+    let content_blocks = body["content"]
+        .as_array()
+        .ok_or_else(|| CompletionError::ResponseError("missing content array".into()))?;
+
+    let mut assistant_content = Vec::new();
+
+    for block in content_blocks {
+        match block["type"].as_str() {
+            Some("text") => {
+                let text = block["text"].as_str().unwrap_or("");
+                if !text.trim().is_empty() {
+                    assistant_content.push(AssistantContent::Text(Text {
+                        text: text.to_string(),
+                    }));
+                } else {
+                    tracing::debug!("dropping empty text block in Anthropic response");
+                }
+            }
+            Some("tool_use") => {
+                let id = block["id"].as_str().unwrap_or("").to_string();
+                let name = block["name"].as_str().unwrap_or("").to_string();
+                let arguments = block["input"].clone();
+                assistant_content.push(AssistantContent::ToolCall(make_tool_call(
+                    id, name, arguments,
+                )));
+            }
+            Some("thinking") => {
+                // Thinking blocks contain internal reasoning, not actionable output.
+                // We'll skip them but log for debugging.
+                tracing::debug!("skipping thinking block in Anthropic response");
+            }
+            _ => {
+                // Unknown block type - log but skip
+                tracing::debug!(
+                    "skipping unknown block type in Anthropic response: {:?}",
+                    block["type"].as_str()
+                );
+            }
+        }
+    }
+
+    let choice = match OneOrMany::many(assistant_content) {
+        Ok(choice) => choice,
+        Err(_) => {
+            // Anthropic can return an empty content array when stop_reason is
+            // end_turn and the model has nothing further to say (e.g. after a
+            // side-effect-only tool call like react/skip). Treat this as a clean
+            // no-op so the agentic loop terminates gracefully.
+            let stop_reason = body["stop_reason"].as_str().unwrap_or("unknown");
+            if stop_reason == "end_turn" {
+                tracing::debug!(
+                    stop_reason,
+                    content_blocks = content_blocks.len(),
+                    "empty assistant_content from Anthropic end_turn — returning synthetic whitespace placeholder"
+                );
+                OneOrMany::one(AssistantContent::Text(Text {
+                    text: " ".to_string(),
+                }))
+            } else {
+                tracing::warn!(
+                    stop_reason,
+                    content_blocks = content_blocks.len(),
+                    "unexpected empty assistant_content from Anthropic"
+                );
+                return Err(CompletionError::ResponseError(format!(
+                    "empty response from Anthropic (stop_reason: {stop_reason})"
+                )));
+            }
+        }
+    };
+
+    let input_tokens = body["usage"]["input_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = body["usage"]["output_tokens"].as_u64().unwrap_or(0);
+    let cached = body["usage"]["cache_read_input_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+
+    Ok(completion::CompletionResponse {
+        choice,
+        usage: completion::Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            cached_input_tokens: cached,
+        },
+        raw_response: RawResponse { body },
+    })
+}
+
+fn parse_openai_response(
+    body: serde_json::Value,
+    provider_label: &str,
+) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+    let choice = &body["choices"][0]["message"];
+
+    let mut assistant_content = Vec::new();
+
+    if let Some(text) = choice["content"].as_str()
+        && !text.is_empty()
+    {
+        assistant_content.push(AssistantContent::Text(Text {
+            text: text.to_string(),
+        }));
+    }
+
+    // Some reasoning models (e.g., NVIDIA kimi-k2.5) return reasoning in a separate field
+    if assistant_content.is_empty()
+        && let Some(reasoning) = choice["reasoning_content"].as_str()
+        && !reasoning.is_empty()
+    {
+        tracing::debug!(
+            provider = %provider_label,
+            "extracted reasoning_content as main content"
+        );
+        assistant_content.push(AssistantContent::Text(Text {
+            text: reasoning.to_string(),
+        }));
+    }
+
+    if let Some(tool_calls) = choice["tool_calls"].as_array() {
+        for tc in tool_calls {
+            let id = tc["id"].as_str().unwrap_or("").to_string();
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            // OpenAI-compatible APIs usually return arguments as a JSON string.
+            // Some providers return it as a raw JSON object instead.
+            let arguments_field = &tc["function"]["arguments"];
+            let arguments = arguments_field
+                .as_str()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .or_else(|| arguments_field.as_object().map(|_| arguments_field.clone()))
+                .unwrap_or(serde_json::json!({}));
+            assistant_content.push(AssistantContent::ToolCall(make_tool_call(
+                id, name, arguments,
+            )));
+        }
+    }
+
+    let result_choice = OneOrMany::many(assistant_content.clone()).map_err(|_| {
+        tracing::warn!(
+            provider = %provider_label,
+            choice = ?choice,
+            "empty response from provider"
+        );
+        CompletionError::ResponseError(format!("empty response from {provider_label}"))
+    })?;
+
+    let input_tokens = body["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = body["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    let cached = body["usage"]["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+
+    Ok(completion::CompletionResponse {
+        choice: result_choice,
+        usage: completion::Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            cached_input_tokens: cached,
+        },
+        raw_response: RawResponse { body },
+    })
+}
+
+fn parse_openai_responses_response(
+    body: serde_json::Value,
+) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+    let output_items = body["output"]
+        .as_array()
+        .ok_or_else(|| CompletionError::ResponseError("missing output array".into()))?;
+
+    let mut assistant_content = Vec::new();
+
+    for output_item in output_items {
+        match output_item["type"].as_str() {
+            Some("message") => {
+                if let Some(content_items) = output_item["content"].as_array() {
+                    for content_item in content_items {
+                        if content_item["type"].as_str() == Some("output_text")
+                            && let Some(text) = content_item["text"].as_str()
+                            && !text.is_empty()
+                        {
+                            assistant_content.push(AssistantContent::Text(Text {
+                                text: text.to_string(),
+                            }));
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                let call_id = output_item["call_id"]
+                    .as_str()
+                    .or_else(|| output_item["id"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = output_item["name"].as_str().unwrap_or("").to_string();
+                let arguments = output_item["arguments"]
+                    .as_str()
+                    .and_then(|arguments| serde_json::from_str(arguments).ok())
+                    .unwrap_or(serde_json::json!({}));
+
+                assistant_content.push(AssistantContent::ToolCall(make_tool_call(
+                    call_id, name, arguments,
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let choice = OneOrMany::many(assistant_content).map_err(|_| {
+        CompletionError::ResponseError("empty response from OpenAI Responses API".into())
+    })?;
+
+    let input_tokens = body["usage"]["input_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = body["usage"]["output_tokens"].as_u64().unwrap_or(0);
+    let cached = body["usage"]["input_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+
+    Ok(completion::CompletionResponse {
+        choice,
+        usage: completion::Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            cached_input_tokens: cached,
+        },
+        raw_response: RawResponse { body },
+    })
+}
+
+fn parse_openai_responses_sse_response(
+    response_text: &str,
+) -> Result<serde_json::Value, CompletionError> {
+    for line in response_text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+
+        if data.trim().is_empty() || data.trim() == "[DONE]" {
+            continue;
+        }
+
+        let Ok(event_body) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+
+        if event_body["type"].as_str() == Some("response.completed")
+            && let Some(response) = event_body.get("response")
+        {
+            return Ok(response.clone());
+        }
+    }
+
+    Err(CompletionError::ProviderError(format!(
+        "OpenAI Responses SSE stream missing response.completed event.\nBody: {}",
+        truncate_body(response_text)
+    )))
+}
+
+fn parse_openai_error_message(response_text: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(response_text).ok()?;
+    parsed["error"]["message"]
+        .as_str()
+        .or(parsed["detail"].as_str())
+        .or(parsed["message"].as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn remap_model_name_for_api(provider: &str, model_name: &str) -> String {
+    if provider == "zai-coding-plan" {
+        // Coding Plan endpoint expects plain model ids (e.g. "glm-5").
+        model_name
+            .strip_prefix("zai/")
+            .unwrap_or(model_name)
+            .to_string()
+    } else {
+        model_name.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig::message::Message;
+
+    #[test]
+    fn reverse_map_restores_original_tool_names() {
+        let original_tools = vec![
+            ("my_read".to_string(), "reads files".to_string()),
+            ("my_bash".to_string(), "runs commands".to_string()),
+        ];
+
+        let mut completion = completion::CompletionResponse {
+            choice: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "tc1".into(),
+                call_id: None,
+                function: ToolFunction {
+                    name: "My_Read".into(),
+                    arguments: serde_json::json!({}),
+                },
+                signature: None,
+                additional_params: None,
+            })),
+            usage: completion::Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                cached_input_tokens: 0,
+            },
+            raw_response: RawResponse {
+                body: serde_json::json!({}),
+            },
+        };
+
+        reverse_map_tool_names(&mut completion, &original_tools);
+
+        let first = completion.choice.first_ref();
+        if let AssistantContent::ToolCall(tc) = first {
+            assert_eq!(tc.function.name, "my_read");
+        } else {
+            panic!("expected ToolCall");
+        }
+    }
+    #[test]
+    fn coding_plan_model_name_uses_plain_glm_id() {
+        assert_eq!(
+            remap_model_name_for_api("zai-coding-plan", "glm-5"),
+            "glm-5"
+        );
+        assert_eq!(
+            remap_model_name_for_api("zai-coding-plan", "zai/glm-5"),
+            "glm-5"
+        );
+        assert_eq!(
+            remap_model_name_for_api("openai", "gpt-4o-mini"),
+            "gpt-4o-mini"
+        );
+        assert_eq!(remap_model_name_for_api("openai", "zai/glm-5"), "zai/glm-5");
+    }
+
+    #[test]
+    fn parse_anthropic_response_drops_empty_text_blocks() {
+        let body = serde_json::json!({
+            "content": [
+                {"type": "text", "text": ""},
+                {"type": "text", "text": "   "},
+                {
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "reply",
+                    "input": {"content": "hi"}
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+
+        let response = parse_anthropic_response(body).expect("valid response");
+        let contents: Vec<_> = response.choice.iter().collect();
+        assert_eq!(contents.len(), 1);
+        assert!(matches!(contents[0], AssistantContent::ToolCall(_)));
+    }
+
+    #[test]
+    fn convert_messages_to_anthropic_omits_empty_text_messages() {
+        let messages = OneOrMany::many(vec![
+            Message::User {
+                content: OneOrMany::one(UserContent::text("   ")),
+            },
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::text("")),
+            },
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::tool_call(
+                    "call_1",
+                    "reply",
+                    serde_json::json!({"content": "ok"}),
+                )),
+            },
+        ])
+        .expect("non-empty message list");
+
+        let converted = convert_messages_to_anthropic(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0]["role"], "assistant");
+        assert_eq!(converted[0]["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn end_turn_placeholder_is_not_forwarded_back_to_anthropic() {
+        let body = serde_json::json!({
+            "content": [],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 0}
+        });
+
+        let response = parse_anthropic_response(body).expect("valid response");
+        let history = OneOrMany::one(Message::Assistant {
+            id: None,
+            content: response.choice,
+        });
+
+        let converted = convert_messages_to_anthropic(&history);
+        assert!(converted.is_empty());
+    }
+
+    #[test]
+    fn empty_non_end_turn_response_returns_error() {
+        let body = serde_json::json!({
+            "content": [],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 1, "output_tokens": 0}
+        });
+
+        let error = parse_anthropic_response(body).expect_err("should fail");
+        assert!(matches!(error, CompletionError::ResponseError(_)));
+        assert!(error.to_string().contains("stop_reason: max_tokens"));
+    }
+}

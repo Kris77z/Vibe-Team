@@ -1,0 +1,4 @@
+{
+  "title": "Features",
+  "pages": ["workers", "tasks", "opencode", "tools", "mcp", "browser", "cron", "skills", "ingestion"]
+}

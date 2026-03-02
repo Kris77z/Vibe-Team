@@ -1,0 +1,210 @@
+//! SpacebotHook: Prompt hook for channels, branches, and workers.
+
+use crate::{AgentId, ChannelId, ProcessEvent, ProcessId, ProcessType};
+use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
+use rig::completion::{CompletionModel, CompletionResponse, Message};
+use tokio::sync::broadcast;
+
+/// Hook for observing agent behavior and sending events.
+#[derive(Clone)]
+pub struct SpacebotHook {
+    agent_id: AgentId,
+    process_id: ProcessId,
+    process_type: ProcessType,
+    channel_id: Option<ChannelId>,
+    event_tx: broadcast::Sender<ProcessEvent>,
+}
+
+impl SpacebotHook {
+    /// Create a new hook.
+    pub fn new(
+        agent_id: AgentId,
+        process_id: ProcessId,
+        process_type: ProcessType,
+        channel_id: Option<ChannelId>,
+        event_tx: broadcast::Sender<ProcessEvent>,
+    ) -> Self {
+        Self {
+            agent_id,
+            process_id,
+            process_type,
+            channel_id,
+            event_tx,
+        }
+    }
+
+    /// Send a status update event.
+    pub fn send_status(&self, status: impl Into<String>) {
+        let event = ProcessEvent::StatusUpdate {
+            agent_id: self.agent_id.clone(),
+            process_id: self.process_id.clone(),
+            status: status.into(),
+        };
+        self.event_tx.send(event).ok();
+    }
+
+    /// Scan content for potential secret leaks, including encoded forms.
+    ///
+    /// Delegates to the shared implementation in `secrets::scrub`.
+    fn scan_for_leaks(&self, content: &str) -> Option<String> {
+        crate::secrets::scrub::scan_for_leaks(content)
+    }
+}
+
+// Timer map for tool call duration measurement. Entries are inserted in
+// on_tool_call and removed in on_tool_result. If the agent terminates between
+// the two hooks (e.g. leak detection), orphaned entries stay in the map.
+// Bounded by concurrent tool calls so not a practical leak.
+#[cfg(feature = "metrics")]
+static TOOL_CALL_TIMERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+impl<M> PromptHook<M> for SpacebotHook
+where
+    M: CompletionModel,
+{
+    async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
+        // Log the completion call but don't block it
+        tracing::debug!(
+            process_id = %self.process_id,
+            process_type = %self.process_type,
+            "completion call started"
+        );
+
+        HookAction::Continue
+    }
+
+    async fn on_completion_response(
+        &self,
+        _prompt: &Message,
+        _response: &CompletionResponse<M::Response>,
+    ) -> HookAction {
+        tracing::debug!(
+            process_id = %self.process_id,
+            "completion response received"
+        );
+
+        HookAction::Continue
+    }
+
+    async fn on_tool_call(
+        &self,
+        tool_name: &str,
+        _tool_call_id: Option<String>,
+        _internal_call_id: &str,
+        args: &str,
+    ) -> ToolCallHookAction {
+        // Scan tool arguments for secrets before execution
+        if let Some(leak) = self.scan_for_leaks(args) {
+            tracing::error!(
+                process_id = %self.process_id,
+                tool_name = %tool_name,
+                leak_prefix = %&leak[..leak.len().min(8)],
+                "secret leak detected in tool arguments, blocking call"
+            );
+            return ToolCallHookAction::Skip {
+                reason: "Tool call blocked: arguments contained a secret.".into(),
+            };
+        }
+
+        // Send event without blocking. Truncate args to keep broadcast payloads bounded.
+        let capped_args = crate::tools::truncate_output(args, 2_000);
+        let event = ProcessEvent::ToolStarted {
+            agent_id: self.agent_id.clone(),
+            process_id: self.process_id.clone(),
+            channel_id: self.channel_id.clone(),
+            tool_name: tool_name.to_string(),
+            args: capped_args,
+        };
+        self.event_tx.send(event).ok();
+
+        tracing::debug!(
+            process_id = %self.process_id,
+            tool_name = %tool_name,
+            "tool call started"
+        );
+
+        #[cfg(feature = "metrics")]
+        if let Ok(mut timers) = TOOL_CALL_TIMERS.lock() {
+            timers.insert(_internal_call_id.to_string(), std::time::Instant::now());
+        }
+
+        ToolCallHookAction::Continue
+    }
+
+    async fn on_tool_result(
+        &self,
+        tool_name: &str,
+        _tool_call_id: Option<String>,
+        _internal_call_id: &str,
+        _args: &str,
+        result: &str,
+    ) -> HookAction {
+        // Scan for potential leaks in tool output and terminate if found.
+        // The result is already in Rig's history at this point, but terminating
+        // prevents the agent from forwarding the leaked content to external
+        // services via subsequent tool calls.
+        if let Some(leak) = self.scan_for_leaks(result) {
+            tracing::error!(
+                process_id = %self.process_id,
+                tool_name = %tool_name,
+                leak_prefix = %&leak[..leak.len().min(8)],
+                "secret leak detected in tool output, terminating agent"
+            );
+            return HookAction::Terminate {
+                reason: "Tool output contained a secret. Agent terminated to prevent exfiltration."
+                    .into(),
+            };
+        }
+
+        // Cap the result stored in the broadcast event to avoid blowing up
+        // event subscribers with multi-MB tool results.
+        let capped_result =
+            crate::tools::truncate_output(result, crate::tools::MAX_TOOL_OUTPUT_BYTES);
+        let event = ProcessEvent::ToolCompleted {
+            agent_id: self.agent_id.clone(),
+            process_id: self.process_id.clone(),
+            channel_id: self.channel_id.clone(),
+            tool_name: tool_name.to_string(),
+            result: capped_result,
+        };
+        self.event_tx.send(event).ok();
+
+        tracing::debug!(
+            process_id = %self.process_id,
+            tool_name = %tool_name,
+            result_bytes = result.len(),
+            "tool call completed"
+        );
+
+        #[cfg(feature = "metrics")]
+        {
+            let metrics = crate::telemetry::Metrics::global();
+            metrics
+                .tool_calls_total
+                .with_label_values(&[&*self.agent_id, tool_name])
+                .inc();
+            if let Some(start) = TOOL_CALL_TIMERS
+                .lock()
+                .ok()
+                .and_then(|mut timers| timers.remove(_internal_call_id))
+            {
+                metrics
+                    .tool_call_duration_seconds
+                    .observe(start.elapsed().as_secs_f64());
+            }
+        }
+
+        // Channel turns should end immediately after a successful reply tool call.
+        // This avoids extra post-reply LLM iterations that add latency, cost, and
+        // noisy logs when providers return empty trailing responses.
+        if self.process_type == ProcessType::Channel && tool_name == "reply" {
+            return HookAction::Terminate {
+                reason: "reply delivered".into(),
+            };
+        }
+
+        HookAction::Continue
+    }
+}

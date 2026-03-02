@@ -1,0 +1,18 @@
+target/
+.git/
+.DS_Store
+.fastembed_cache/
+.github/
+
+# Frontend build artifacts (rebuilt in Docker)
+interface/node_modules/
+interface/dist/
+
+# Not needed for the build
+docs/
+tests/
+scripts/
+fly.toml
+AGENTS.md
+RUST_STYLE_GUIDE.md
+LICENSE
