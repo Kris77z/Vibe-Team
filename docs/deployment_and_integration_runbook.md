@@ -67,6 +67,20 @@
 
 ---
 
+## 2.2 当前文档的标准部署口径
+
+自 `2026-03-03` 起，这份文档对 `vibe-team` 的标准部署口径统一为：
+
+- 源码 checkout 可放在：`$HOME/Desktop/Dev/Vibe-Team`
+- 运行时实例根应放在：`$HOME/instances/vibe-team`
+- `OpenClaw Gateway` 标准端口：`18889`
+- `Antfarm Dashboard` 标准端口：`3333`
+- `Spacebot` 标准端口：`19898`
+
+如果前文的通用示例与第 `21` 节实机落地结果冲突，以这套实例根模型和第 `21` 节为准。
+
+---
+
 ## 3. 推荐拓扑
 
 推荐把三者部署在同一台 Mac，同机本地互通：
@@ -77,21 +91,95 @@
   -> Spacebot SSE             http://127.0.0.1:19898/api/events
 
 Spacebot
-  -> Antfarm CLI             antfarm workflow run ...
+  -> Antfarm CLI             /Users/kris/instances/vibe-team/bin/antfarm-vibe-team workflow run ...
   -> Antfarm Dashboard API   http://127.0.0.1:3333/api/...
 
 Antfarm
-  -> OpenClaw state/config   ~/.openclaw 或 OPENCLAW_STATE_DIR
-  -> OpenClaw runtime        已完成 onboard / gateway 可用
+  -> OpenClaw state/config   $HOME/instances/vibe-team/state + config/openclaw.json
+  -> OpenClaw runtime        gateway 监听 127.0.0.1:18889
 ```
 
-推荐端口：
+当前标准端口：
 
 - `Spacebot API/UI`: `19898`
 - `Antfarm Dashboard`: `3333`
-- `OpenClaw Gateway`: `18789`
+- `OpenClaw Gateway`: `18889`
 
 建议第一版全部只监听本机回环地址，不要直接暴露公网。
+
+---
+
+## 3.1 开发机通过 Tailscale 访问部署机
+
+当前标准使用方式不是“开发机运行一部分、部署机运行一部分”，而是：
+
+- `部署机` 运行完整后端链路：
+  - `Spacebot`
+  - `Antfarm`
+  - `OpenClaw`
+  - `target-project`
+- `开发机` 只作为远程访问端：
+  - 打开部署机上的 `Spacebot UI`
+  - 通过部署机上的 `Spacebot` 触发 workflow
+  - 在开发机浏览器里接收 SSE 状态更新
+
+推荐通过 `Tailscale` 建立开发机到部署机的访问链路。
+
+### 推荐方式：Tailscale + SSH 本地端口转发
+
+第一版最稳的方式仍然是让 `Spacebot` 继续监听部署机本地回环地址：
+
+- `Spacebot`: `127.0.0.1:19898`
+- `Antfarm Dashboard`: `127.0.0.1:3333`
+- `OpenClaw Gateway`: `127.0.0.1:18889`
+
+然后在开发机执行：
+
+```bash
+ssh -N -L 19898:127.0.0.1:19898 <deploy-user>@<deploy-tailnet-host>
+```
+
+例如：
+
+```bash
+ssh -N -L 19898:127.0.0.1:19898 kris@vibe-team-mac
+```
+
+之后在开发机浏览器打开：
+
+```text
+http://127.0.0.1:19898
+```
+
+说明：
+
+- 这条链路只把 `Spacebot` 暴露给开发机浏览器
+- `Antfarm` 和 `OpenClaw` 仍然只在部署机本地互通
+- 现有 `Spacebot` SSE 也会走同一条隧道
+- 这是当前联调阶段的默认推荐方案
+
+### 为什么不建议第一版直接把 Spacebot 绑定到 Tailscale IP
+
+因为当前阶段优先目标是减少变量，而不是先做对外服务化。
+
+直接绑定到 `Tailscale IP` 或 `0.0.0.0` 会额外引入：
+
+- 监听地址选择
+- CORS / Origin 行为差异
+- 认证与暴露面控制
+- 后续 HTTPS / 反代决策
+
+这些都不属于当前 MVP 的必需条件。
+
+### 长期方案
+
+如果后续要把部署机上的 `Spacebot` 作为长期远程入口，再考虑：
+
+1. 通过 `Tailscale` 直接访问部署机服务
+2. 或在部署机前面加反向代理与 HTTPS
+3. 或补 `auth_token` / 统一鉴权
+
+但这些都应放在当前联调跑通之后。
 
 ---
 
@@ -129,38 +217,41 @@ cargo --version
 
 ## 5. 推荐目录布局
 
-推荐在目标 Mac 上保持类似结构：
+推荐把“源码 checkout”和“运行时实例根”分开：
 
 ```text
-$HOME/dev/vibe-team/
+$HOME/Desktop/Dev/Vibe-Team/
 ├── openclaw/
 ├── antfarm/
+└── spacebot/
+
+$HOME/instances/vibe-team/
+├── config/
+│   └── openclaw.json
+├── state/
 ├── spacebot/
-└── target-project/
+├── antfarm/
+├── antfarm-home/
+└── bin/
 ```
 
 推荐环境变量：
 
 ```bash
-export VIBE_TEAM_HOME="$HOME/dev/vibe-team"
-export TARGET_PROJECT="$HOME/dev/target-project"
-export OPENCLAW_STATE_DIR="$HOME/.openclaw"
-export SPACEBOT_DIR="$HOME/.spacebot"
+export VIBE_TEAM_HOME="$HOME/Desktop/Dev/Vibe-Team"
+export INSTANCE_ROOT="$HOME/instances/vibe-team"
+export TARGET_PROJECT="$HOME/Desktop/Dev/target-project"
+export OPENCLAW_STATE_DIR="$INSTANCE_ROOT/state"
+export OPENCLAW_CONFIG_PATH="$INSTANCE_ROOT/config/openclaw.json"
+export SPACEBOT_DIR="$INSTANCE_ROOT/spacebot"
 ```
 
-如果你希望把 OpenClaw/Antfarm 状态放到项目私有目录，也可以：
+要求：
 
-```bash
-export OPENCLAW_STATE_DIR="$HOME/dev/vibe-runtime/openclaw"
-```
-
-但必须保证：
-
-- `OpenClaw`
-- `Antfarm`
-- `Spacebot`
-
-在运行时看到的是同一个 `OPENCLAW_STATE_DIR`。
+- 源码目录可以删掉重拉
+- 实例根目录不应依赖 `Desktop` 权限
+- `OpenClaw`、`Antfarm`、`Spacebot` 必须看到同一个 `OPENCLAW_STATE_DIR`
+- `launchd`、wrapper、运行时二进制都应只依赖实例根
 
 ---
 
@@ -175,8 +266,8 @@ export OPENCLAW_STATE_DIR="$HOME/dev/vibe-runtime/openclaw"
 
 原因：
 
-- `Antfarm` 默认会依赖 `~/.openclaw/openclaw.json`
-- 先做 `OpenClaw onboard`，能保证 OpenClaw 的状态目录和配置先存在
+- `Antfarm` 会依赖 `OPENCLAW_STATE_DIR` 和 `OPENCLAW_CONFIG_PATH`
+- 先做 `OpenClaw onboard`，能保证实例根里的状态目录和配置先存在
 - `Spacebot` 的真实 Antfarm service 又依赖：
   - 可执行的 `antfarm` CLI
   - 可访问的 `Antfarm Dashboard`
@@ -199,7 +290,7 @@ export OPENCLAW_STATE_DIR="$HOME/dev/vibe-runtime/openclaw"
 - 适合你希望目标 Mac 上使用当前工作区里的源码版本
 - 适合后续一起做源码级排查
 
-当前项目更推荐方案 B，因为你本地是按源码集成推进的。
+按当前实机落地经验，目标 Mac 上更推荐方案 A 或“全局 CLI + 实例根状态目录”的组合；源码部署更适合排查和二次开发。
 
 ### 7.2 OpenClaw 源码部署
 
@@ -229,7 +320,9 @@ openclaw doctor
 如果你要前台观察 Gateway，也可以临时前台启动：
 
 ```bash
-openclaw gateway --port 18789 --verbose
+OPENCLAW_STATE_DIR="$INSTANCE_ROOT/state" \
+OPENCLAW_CONFIG_PATH="$INSTANCE_ROOT/config/openclaw.json" \
+openclaw gateway --port 18889 --verbose
 ```
 
 注意：
@@ -266,7 +359,7 @@ npm link
 方式 B，不做全局 link，而是在 `Spacebot` 环境变量里显式指定 CLI 路径：
 
 ```bash
-export SPACEBOT_ANTFARM_CLI_PATH="$VIBE_TEAM_HOME/antfarm/dist/cli/cli.js"
+export SPACEBOT_ANTFARM_CLI_PATH="$INSTANCE_ROOT/bin/antfarm-vibe-team"
 ```
 
 如果你已经用了 `npm link`，可以不再设置 `SPACEBOT_ANTFARM_CLI_PATH`。
@@ -305,10 +398,10 @@ antfarm dashboard start --port 3333
 
 ### 8.5 Antfarm 关键注意点
 
-- `Antfarm` 默认状态目录不是项目目录，而是：
-  - `~/.openclaw/antfarm`
-  - `~/.openclaw/workspaces/workflows`
-- 如果你设置了 `OPENCLAW_STATE_DIR`，这些目录会跟着改
+- 在当前标准部署中，`Antfarm` 运行时应放在：`$INSTANCE_ROOT/antfarm`
+- `Antfarm` 的状态目录跟随 `OPENCLAW_STATE_DIR`，当前标准落点是：
+  - `$INSTANCE_ROOT/state/antfarm`
+  - `$INSTANCE_ROOT/state/workspaces/workflows`
 - `Antfarm` 当前工作流仍大量依赖 prompt 中的 `REPO` / `BRANCH` 信息
 - `Spacebot -> Antfarm` 现在已有独立的 `repo_path` / `branch` / `worktree_path` 字段
 - 当前 launcher 会把这些结构化字段自动展开成兼容现有 workflow 的任务正文
@@ -344,9 +437,9 @@ export SPACEBOT_SKIP_FRONTEND_BUILD=1
 
 ### 9.3 准备最小配置
 
-默认实例目录：
+当前标准实例目录：
 
-- `~/.spacebot`
+- `$INSTANCE_ROOT/spacebot`
 - 或 `SPACEBOT_DIR` 指向的目录
 
 创建配置文件：
@@ -354,12 +447,17 @@ export SPACEBOT_SKIP_FRONTEND_BUILD=1
 ```bash
 mkdir -p "$SPACEBOT_DIR"
 cat > "$SPACEBOT_DIR/config.toml" <<'EOF'
-[llm]
-openrouter_key = "env:OPENROUTER_API_KEY"
+[llm.provider.openai-relay]
+api_type = "openai_completions"
+base_url = "https://ai.co.link/openai"
+api_key = "env:OPENAI_AUTH_KEY"
 
 [defaults.routing]
-channel = "anthropic/claude-sonnet-4"
-worker = "anthropic/claude-sonnet-4"
+channel = "openai-relay/gpt-5.1"
+branch = "openai-relay/gpt-5.1"
+worker = "openai-relay/gpt-5.1"
+compactor = "openai-relay/gpt-5.1"
+cortex = "openai-relay/gpt-5.1"
 
 [api]
 enabled = true
@@ -398,24 +496,28 @@ Authorization: Bearer <token>
 推荐用一个启动脚本统一注入：
 
 ```bash
-cat > "$HOME/run-spacebot-antfarm.sh" <<'EOF'
+cat > "$INSTANCE_ROOT/bin/run-spacebot-vibe-team.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-export VIBE_TEAM_HOME="$HOME/dev/vibe-team"
-export SPACEBOT_DIR="$HOME/.spacebot"
-export OPENCLAW_STATE_DIR="$HOME/.openclaw"
+export VIBE_TEAM_HOME="$HOME/Desktop/Dev/Vibe-Team"
+export INSTANCE_ROOT="$HOME/instances/vibe-team"
+export SPACEBOT_DIR="$INSTANCE_ROOT/spacebot"
+export OPENCLAW_STATE_DIR="$INSTANCE_ROOT/state"
+export OPENCLAW_CONFIG_PATH="$INSTANCE_ROOT/config/openclaw.json"
 
-export OPENROUTER_API_KEY="your-key"
+export OPENAI_AUTH_KEY="your-key"
 
 export SPACEBOT_ANTFARM_DASHBOARD_URL="http://127.0.0.1:3333"
-export SPACEBOT_ANTFARM_CLI_PATH="antfarm"
-export SPACEBOT_ANTFARM_WORKDIR="$HOME/dev"
+export SPACEBOT_ANTFARM_CLI_PATH="$INSTANCE_ROOT/bin/antfarm-vibe-team"
+export SPACEBOT_ANTFARM_WORKDIR="$HOME/Desktop/Dev"
+export NO_PROXY="127.0.0.1,localhost"
+export no_proxy="127.0.0.1,localhost"
 
-exec "$VIBE_TEAM_HOME/spacebot/target/release/spacebot" --config "$SPACEBOT_DIR/config.toml" start --foreground
+exec "$INSTANCE_ROOT/bin/spacebot" --config "$SPACEBOT_DIR/config.toml" start --foreground
 EOF
 
-chmod +x "$HOME/run-spacebot-antfarm.sh"
+chmod +x "$INSTANCE_ROOT/bin/run-spacebot-vibe-team.sh"
 ```
 
 可选环境变量说明：
@@ -425,8 +527,8 @@ chmod +x "$HOME/run-spacebot-antfarm.sh"
   - 例如：`http://127.0.0.1:3333`
 - `SPACEBOT_ANTFARM_CLI_PATH`
   - 可选
-  - 默认是 `antfarm`
-  - 如果没做 `npm link`，可指向 `dist/cli/cli.js`
+  - 当前标准值是 `$INSTANCE_ROOT/bin/antfarm-vibe-team`
+  - 如果没做 wrapper，也可退回 `antfarm`
 - `SPACEBOT_ANTFARM_WORKDIR`
   - 可选
   - 用于指定 `antfarm workflow run ...` 的工作目录
@@ -440,18 +542,21 @@ chmod +x "$HOME/run-spacebot-antfarm.sh"
 ### 9.5 启动 Spacebot
 
 ```bash
-"$HOME/run-spacebot-antfarm.sh"
+"$INSTANCE_ROOT/bin/run-spacebot-vibe-team.sh"
 ```
 
 或者不写脚本，直接当前 shell 启动：
 
 ```bash
-cd "$VIBE_TEAM_HOME/spacebot"
-export SPACEBOT_DIR="$HOME/.spacebot"
-export OPENCLAW_STATE_DIR="$HOME/.openclaw"
+export INSTANCE_ROOT="$HOME/instances/vibe-team"
+export SPACEBOT_DIR="$INSTANCE_ROOT/spacebot"
+export OPENCLAW_STATE_DIR="$INSTANCE_ROOT/state"
+export OPENCLAW_CONFIG_PATH="$INSTANCE_ROOT/config/openclaw.json"
 export SPACEBOT_ANTFARM_DASHBOARD_URL="http://127.0.0.1:3333"
-export SPACEBOT_ANTFARM_CLI_PATH="antfarm"
-./target/release/spacebot --config "$SPACEBOT_DIR/config.toml" start --foreground
+export SPACEBOT_ANTFARM_CLI_PATH="$INSTANCE_ROOT/bin/antfarm-vibe-team"
+export NO_PROXY="127.0.0.1,localhost"
+export no_proxy="127.0.0.1,localhost"
+"$INSTANCE_ROOT/bin/spacebot" --config "$SPACEBOT_DIR/config.toml" start --foreground
 ```
 
 ---
@@ -817,11 +922,11 @@ curl http://127.0.0.1:19898/api/antfarm/conversations/portal:chat:pm/runs
 
 ### 16.1 OpenClaw / Antfarm
 
-默认：
+当前标准落点：
 
-- `~/.openclaw/openclaw.json`
-- `~/.openclaw/antfarm/`
-- `~/.openclaw/workspaces/workflows/`
+- `$INSTANCE_ROOT/config/openclaw.json`
+- `$INSTANCE_ROOT/state/antfarm/`
+- `$INSTANCE_ROOT/state/workspaces/workflows/`
 
 可被这些环境变量覆盖：
 
@@ -830,13 +935,13 @@ curl http://127.0.0.1:19898/api/antfarm/conversations/portal:chat:pm/runs
 
 ### 16.2 Spacebot
 
-默认：
+当前标准落点：
 
-- `~/.spacebot/config.toml`
-- `~/.spacebot/logs/`
-- `~/.spacebot/agents/...`
-- `~/.spacebot/data/secrets.redb`
-- `~/.spacebot/anthropic_oauth.json`
+- `$INSTANCE_ROOT/spacebot/config.toml`
+- `$INSTANCE_ROOT/spacebot/logs/`
+- `$INSTANCE_ROOT/spacebot/agents/...`
+- `$INSTANCE_ROOT/spacebot/data/secrets.redb`
+- `$INSTANCE_ROOT/spacebot/anthropic_oauth.json`
 
 可被这个环境变量覆盖：
 
@@ -912,54 +1017,19 @@ cargo build --release
 
 ## 19. 推荐的第一次完整联调脚本
 
-如果你只想跑最短路径，按这个顺序即可：
+如果你已经按当前标准实例根完成部署，第一次联调按这个顺序即可：
 
 ```bash
-export VIBE_TEAM_HOME="$HOME/dev/vibe-team"
-export TARGET_PROJECT="$HOME/dev/target-project"
-export OPENCLAW_STATE_DIR="$HOME/.openclaw"
-export SPACEBOT_DIR="$HOME/.spacebot"
+export INSTANCE_ROOT="$HOME/instances/vibe-team"
+export TARGET_PROJECT="$HOME/Desktop/Dev/target-project"
 
-cd "$VIBE_TEAM_HOME/openclaw"
-pnpm install
-pnpm ui:build
-pnpm build
-pnpm openclaw onboard --install-daemon
+launchctl kickstart -k gui/$(id -u)/ai.openclaw.vibe-team
+launchctl kickstart -k gui/$(id -u)/ai.antfarm.vibe-team
+launchctl kickstart -k gui/$(id -u)/ai.spacebot.vibe-team
 
-cd "$VIBE_TEAM_HOME/antfarm"
-npm install
-npm run build
-npm link
-antfarm install
-
-cd "$VIBE_TEAM_HOME/spacebot/interface"
-bun install
-bun run build
-
-cd "$VIBE_TEAM_HOME/spacebot"
-cargo build --release
-
-cat > "$SPACEBOT_DIR/config.toml" <<'EOF'
-[llm]
-openrouter_key = "env:OPENROUTER_API_KEY"
-
-[defaults.routing]
-channel = "anthropic/claude-sonnet-4"
-worker = "anthropic/claude-sonnet-4"
-
-[api]
-enabled = true
-bind = "127.0.0.1"
-port = 19898
-
-[[agents]]
-id = "pm"
-EOF
-
-export SPACEBOT_ANTFARM_DASHBOARD_URL="http://127.0.0.1:3333"
-export SPACEBOT_ANTFARM_CLI_PATH="antfarm"
-
-./target/release/spacebot --config "$SPACEBOT_DIR/config.toml" start --foreground
+curl http://127.0.0.1:18889/v1/models
+curl http://127.0.0.1:3333/api/workflows
+curl http://127.0.0.1:19898/api/health
 ```
 
 然后在另一个终端执行：
@@ -999,6 +1069,7 @@ http://127.0.0.1:19898
 - `OpenClaw` 在部署机已可用
 - `Antfarm Dashboard` 可访问
 - `Spacebot` 页面可打开
+- 开发机到部署机的 `Tailscale` 链路正常
 - `Spacebot` 已配置真实 `SPACEBOT_ANTFARM_DASHBOARD_URL`
 - `Spacebot` 没有开启 `SPACEBOT_ENABLE_ANTFARM_MOCK`
 - 目标项目路径是绝对路径
@@ -1006,7 +1077,7 @@ http://127.0.0.1:19898
 - 至少有一个可用的 `Run Workflow` preset
 - 先跑 `smoke run`，不要直接跑大需求
 
-如果这 9 项都满足，就可以开始第一次真实项目联调。
+如果这 10 项都满足，就可以开始第一次真实项目联调。
 
 ---
 
@@ -1091,7 +1162,7 @@ http://127.0.0.1:19898
 
 - `OpenClaw launchd`: `/Users/kris/Library/LaunchAgents/ai.openclaw.vibe-team.plist`
 - `Spacebot launchd`: `/Users/kris/Library/LaunchAgents/ai.spacebot.vibe-team.plist`
-- `Antfarm trigger launchd`: `/Users/kris/Library/LaunchAgents/ai.antfarm.vibe-team.plist`
+- `Antfarm dashboard bootstrap launchd`: `/Users/kris/Library/LaunchAgents/ai.antfarm.vibe-team.plist`
 
 对应运行脚本 / wrapper：
 
@@ -1139,9 +1210,9 @@ no_proxy=127.0.0.1,localhost
 
 ### 21.6 Antfarm 迁根时必须一起复制的内容
 
-仅复制 `dist/` 不够。
+不要把这一步理解成“只补齐几个缺的目录”。
 
-本次实机验证表明，迁根到新的实例运行目录时，至少要一起复制：
+本次实机验证表明，迁根到新的实例运行目录时，应复制完整的、已经构建好的 `Antfarm` runtime 根目录。至少包含：
 
 - `antfarm/dist/`
 - `antfarm/node_modules/`
@@ -1185,3 +1256,140 @@ no_proxy=127.0.0.1,localhost
 
 - `/Users/kris/instances/vibe-team` 这套实例根已经可作为后续联调和常驻运行的标准形态
 - 旧的 `~/.openclaw-instances/vibe-team` 已可视为过渡目录，迁移完成后可删除
+
+---
+
+## 22. 下一步推进顺序
+
+结合当前代码状态、总方案和实机落地结果，后续推进不要再平均用力，而应按下面顺序做。
+
+### 22.1 先打通“开发机使用部署机 Spacebot”
+
+当前第一优先级不是继续改 UI，也不是继续扩 workflow，而是验证真实使用路径：
+
+- `部署机` 运行：
+  - `Spacebot`
+  - `Antfarm`
+  - `OpenClaw`
+  - `target-project`
+- `开发机` 负责：
+  - 通过 `Tailscale` 访问部署机
+  - 在浏览器里打开 `Spacebot`
+  - 从 `Spacebot` 页面触发 workflow
+
+建议动作：
+
+1. 在开发机建立到部署机的 `SSH` 端口转发
+2. 在开发机浏览器打开 `http://127.0.0.1:19898`
+3. 进入 `WebChat` 或 `ChannelDetail`
+4. 使用现有 `Run Workflow` 入口发起一次 `smoke run`
+
+本阶段验收标准：
+
+- 页面能正常打开
+- API 请求正常
+- SSE 能持续接收状态更新
+- workflow 能进入 terminal 状态
+- terminal result 能回到 `Spacebot` 页面
+
+### 22.2 再做一次“最小改动 run”
+
+`smoke run` 只验证链路存活，不验证真实交付能力。
+
+第二步应选择一个低风险、易回滚的小任务，例如：
+
+- 改一个文案
+- 补一个很小的测试
+- 新增一个最小开发脚本
+
+目标：
+
+- 验证 workflow 真的能改目标项目
+- 验证 build/test 命令能在真实项目里执行
+- 验证 `Spacebot` 返回的结果摘要足够看懂
+- 验证失败时能通过 `Spacebot` 定位问题
+
+### 22.3 用第一次真实 run 收敛最终输出契约
+
+当前 `Spacebot` 已能展示：
+
+- `changes`
+- `tests`
+- `review_decision`
+- `branch`
+- `pr_url`
+
+但这些字段当前仍然依赖 Antfarm 最终输出的 best-effort 提取。
+
+因此第一次真实 run 完成后，应优先做这件事：
+
+1. 固定 `Antfarm` 最终 step 的输出模板
+2. 明确必填字段：
+   - `STATUS`
+   - `CHANGES`
+   - `TESTS`
+   - `REVIEW_DECISION`
+   - `BRANCH`
+   - `PR_URL`
+   - `OPEN_QUESTIONS`
+3. 让 `Spacebot` 只解析这套固定结构
+
+这一步完成后，系统稳定性会明显高于继续打磨 UI。
+
+### 22.4 联调稳定后，再做 `feature-dev-split`
+
+当前不建议立刻上前后端双流水线。
+
+更稳的顺序是：
+
+1. 先让默认 workflow 稳定跑通
+2. 再根据真实 run 的问题点改 workflow
+3. 最后再引入分工版 workflow：
+   - `planner`
+   - `backend-dev`
+   - `contract-reviewer`
+   - `frontend-dev`
+   - `integrator`
+   - `tester`
+   - `reviewer`
+
+第一版分工 workflow 仍建议采用串行：
+
+```text
+plan
+-> backend-implement
+-> contract-review
+-> frontend-implement
+-> integrate
+-> test
+-> review
+```
+
+不要一开始就追求并行开发。
+
+### 22.5 当前明确不优先做的事项
+
+在以下事项上继续投入，当前边际收益较低：
+
+1. 继续细化 `Spacebot` UI
+2. 做 `Antfarm Dashboard` 嵌入
+3. 做自然语言自动触发 workflow
+4. 做严格前后端物理隔离
+5. 做完全自动化、零人工介入流程
+
+这些能力都应该放在真实联调稳定之后。
+
+### 22.6 当前推荐执行清单
+
+如果只保留最小动作，按这个顺序执行：
+
+1. 开发机连上部署机 `Spacebot`
+2. 跑一次真实 `smoke run`
+3. 跑一次真实 `最小改动 run`
+4. 收集终态输出和失败样例
+5. 回到开发机修改：
+   - Antfarm 最终输出模板
+   - Spacebot 结果解析逻辑
+   - `feature-dev-split` workflow 草案
+
+如果这 5 步走完，下一阶段就可以从“集成开发”转到“稳定交付能力建设”。
