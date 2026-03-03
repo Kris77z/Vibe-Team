@@ -382,10 +382,13 @@ impl AntfarmService for AntfarmDashboardReader {
 
     async fn get_run_summary(&self, run_id: &str) -> anyhow::Result<RunSummary> {
         let run_id = urlencoding::encode(run_id);
+        let run_path = format!("/api/runs/{run_id}");
+        let stories_path = format!("/api/runs/{run_id}/stories");
+        let events_path = format!("/api/runs/{run_id}/events");
         let (run, stories, events) = tokio::try_join!(
-            self.get_json::<AntfarmRunDetail>(&format!("/api/runs/{run_id}")),
-            self.get_json::<Vec<AntfarmStory>>(&format!("/api/runs/{run_id}/stories")),
-            self.get_json::<Vec<AntfarmEvent>>(&format!("/api/runs/{run_id}/events")),
+            self.get_json::<AntfarmRunDetail>(&run_path),
+            self.get_json::<Vec<AntfarmStory>>(&stories_path),
+            self.get_json::<Vec<AntfarmEvent>>(&events_path),
         )?;
 
         Ok(map_run_to_summary(run, stories, events))
@@ -393,9 +396,11 @@ impl AntfarmService for AntfarmDashboardReader {
 
     async fn get_final_run_result(&self, run_id: &str) -> anyhow::Result<Option<FinalRunResult>> {
         let run_id = urlencoding::encode(run_id);
+        let run_path = format!("/api/runs/{run_id}");
+        let events_path = format!("/api/runs/{run_id}/events");
         let (run, events) = tokio::try_join!(
-            self.get_json::<AntfarmRunDetail>(&format!("/api/runs/{run_id}")),
-            self.get_json::<Vec<AntfarmEvent>>(&format!("/api/runs/{run_id}/events")),
+            self.get_json::<AntfarmRunDetail>(&run_path),
+            self.get_json::<Vec<AntfarmEvent>>(&events_path),
         )?;
 
         Ok(map_run_to_final_result(run, events))

@@ -1,4 +1,4 @@
-use crate::api::state::WorkflowRunBinding;
+use crate::api::WorkflowRunBinding;
 
 use sqlx::{Row as _, SqlitePool};
 

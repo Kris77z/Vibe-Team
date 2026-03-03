@@ -30,4 +30,4 @@ mod webchat;
 mod workers;
 
 pub use server::start_http_server;
-pub use state::{AgentInfo, ApiEvent, ApiState};
+pub use state::{AgentInfo, ApiEvent, ApiState, WorkflowRunBinding};

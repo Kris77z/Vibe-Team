@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_HOME="${BASE_HOME:-$HOME}"
+INSTANCE_ROOT="${INSTANCE_ROOT:-/Users/kris/instances/vibe-team}"
+ANT_HOME="${ANT_HOME:-$INSTANCE_ROOT/antfarm-home}"
+
+export HOME="$ANT_HOME"
+export OPENCLAW_PROFILE="${OPENCLAW_PROFILE:-vibe-team}"
+export OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-$INSTANCE_ROOT/state}"
+export OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-$INSTANCE_ROOT/config/openclaw.json}"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+exec /opt/homebrew/bin/node "$INSTANCE_ROOT/antfarm/dist/cli/cli.js" "$@"

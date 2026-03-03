@@ -811,10 +811,11 @@ impl ApiState {
             .resolve_pool_for_conversation(&binding.conversation_id)
             .await
         else {
-            anyhow::bail!(
+            return Err(anyhow::anyhow!(
                 "no agent SQLite pool found for workflow conversation '{}'",
                 binding.conversation_id
-            );
+            )
+            .into());
         };
 
         WorkflowRunBindingStore::new(pool)

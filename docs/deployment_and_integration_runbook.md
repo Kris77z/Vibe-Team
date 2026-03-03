@@ -1007,3 +1007,181 @@ http://127.0.0.1:19898
 - 先跑 `smoke run`，不要直接跑大需求
 
 如果这 9 项都满足，就可以开始第一次真实项目联调。
+
+---
+
+## 21. 2026-03-03 实机落地补充
+
+本节记录一次已经完成的本机落地结果，目标是把 `vibe-team` 的运行时形态收敛到和 `vibe-os` 一致的项目实例模型。
+
+### 21.1 最终实例根目录
+
+最终不要再把运行入口直接挂在 `Desktop` 路径下。
+
+本次实机最终采用：
+
+```text
+/Users/kris/instances/vibe-team/
+  config/
+    openclaw.json
+  state/
+  spacebot/
+  antfarm/
+  antfarm-home/
+  bin/
+    spacebot
+    antfarm-vibe-team
+    run-spacebot-vibe-team.sh
+    run-antfarm-dashboard-vibe-team.sh
+```
+
+说明：
+
+- 源码 checkout 仍可保留在 `/Users/kris/Desktop/Dev/Vibe-Team`
+- 但 `launchd`、常驻服务、wrapper、运行时二进制都应只依赖 `/Users/kris/instances/vibe-team`
+- 这样可以避开 macOS 对 `Desktop` 目录的额外访问限制
+
+### 21.2 为什么不能直接把 launchd 指到 Desktop
+
+本次实机验证中，若 `launchd` 直接执行：
+
+- `/Users/kris/Desktop/Dev/Vibe-Team/...`
+
+会出现：
+
+- `Operation not permitted`
+- `getcwd: cannot access parent directories`
+
+因此：
+
+- `OpenClaw` 可继续使用 Homebrew / 全局 CLI 路径
+- `Spacebot` 二进制应复制到实例根的 `bin/`
+- `Antfarm` runtime 也应复制到实例根，而不是让 `launchd` 直接触达 Desktop checkout
+
+### 21.3 本次最终服务形态
+
+本次实机最终确认可用的端口：
+
+- `OpenClaw Gateway`: `127.0.0.1:18889`
+- `Antfarm Dashboard`: `127.0.0.1:3333`
+- `Spacebot`: `127.0.0.1:19898`
+
+最终服务形态：
+
+- `OpenClaw`: 由 `launchd` 常驻
+- `Spacebot`: 由 `launchd` 常驻
+- `Antfarm Dashboard`: 由 `launchd` 在登录时触发一次 `dashboard start`，再由 `Antfarm` 自己的 daemon 常驻
+
+这里 `Antfarm` 的进程模型与 `OpenClaw` / `Spacebot` 不同：
+
+- `OpenClaw` / `Spacebot` 适合直接由 `launchd` 挂前台长驻
+- `Antfarm dashboard` 更适合沿用它自己的 `dashboard start` -> detached daemon 模型
+
+所以如果你在 `launchctl print` 中看不到一个长期驻留的 `ai.antfarm.vibe-team`，但：
+
+- `3333` 正在监听
+- `/api/workflows` 正常
+- `/api/runs/*` 正常
+
+那是符合预期的，不代表部署失败。
+
+### 21.4 本次实际使用的 launchd 入口
+
+本次实机使用的入口文件为：
+
+- `OpenClaw launchd`: `/Users/kris/Library/LaunchAgents/ai.openclaw.vibe-team.plist`
+- `Spacebot launchd`: `/Users/kris/Library/LaunchAgents/ai.spacebot.vibe-team.plist`
+- `Antfarm trigger launchd`: `/Users/kris/Library/LaunchAgents/ai.antfarm.vibe-team.plist`
+
+对应运行脚本 / wrapper：
+
+- `/Users/kris/instances/vibe-team/bin/spacebot`
+- `/Users/kris/instances/vibe-team/bin/antfarm-vibe-team`
+- `/Users/kris/instances/vibe-team/bin/run-spacebot-vibe-team.sh`
+- `/Users/kris/instances/vibe-team/bin/run-antfarm-dashboard-vibe-team.sh`
+
+### 21.5 Spacebot 最终 provider 口径
+
+本次实机没有让 `Spacebot` 直接走本地 `OpenClaw gateway` 的 Responses API 作为自己的主 LLM provider。
+
+原因：
+
+- 本地 `OpenClaw` 的 `/v1/responses` 可用
+- 但 `Spacebot` 的某些调用 payload 与当前本地 gateway 的 Responses 兼容性并不完全一致
+
+最终稳定方案是让 `Spacebot` 直接使用标准 OpenAI-compatible relay：
+
+```toml
+[llm.provider.openai-relay]
+api_type = "openai_completions"
+base_url = "https://ai.co.link/openai"
+api_key = "env:OPENAI_AUTH_KEY"
+
+[defaults.routing]
+channel = "openai-relay/gpt-5.1"
+branch = "openai-relay/gpt-5.1"
+worker = "openai-relay/gpt-5.1"
+compactor = "openai-relay/gpt-5.1"
+cortex = "openai-relay/gpt-5.1"
+```
+
+注意：
+
+- `Spacebot` 访问外部 relay 时可继续走本机代理
+- 但访问本地 `Antfarm dashboard` 必须设置：
+
+```bash
+NO_PROXY=127.0.0.1,localhost
+no_proxy=127.0.0.1,localhost
+```
+
+否则本地 `127.0.0.1:3333` 会被错误地走代理，导致 `502`
+
+### 21.6 Antfarm 迁根时必须一起复制的内容
+
+仅复制 `dist/` 不够。
+
+本次实机验证表明，迁根到新的实例运行目录时，至少要一起复制：
+
+- `antfarm/dist/`
+- `antfarm/node_modules/`
+- `antfarm/workflows/`
+- `antfarm/agents/`
+- `antfarm/package.json`
+
+否则会出现以下问题：
+
+- dashboard 启动时缺少 `yaml`
+- `/api/workflows` 返回空数组
+- workflow install 报 `Missing bootstrap file for agent "setup"`
+
+### 21.7 OpenClaw 配置迁根时必须检查的字段
+
+如果实例根从旧路径迁到新路径，`config/openclaw.json` 中以下字段必须同步更新：
+
+- `state/logs` 路径
+- workflow subagent 的 `workspace`
+- workflow subagent 的 `agentDir`
+- 任何硬编码到旧实例根的 `state/workspaces/...`
+
+本次实机迁根时，`openclaw.json` 中这些字段如果不替换，会导致：
+
+- Gateway 虽然能起
+- 但 workflow agents 仍落回旧实例路径
+
+### 21.8 本次实机最终 smoke 结果
+
+本次实机最终确认通过：
+
+- `OpenClaw /v1/responses` 正常
+- `Spacebot /api/health` 正常
+- `Spacebot /api/status` 正常
+- `Antfarm /api/workflows` 正常
+- `Spacebot -> Antfarm` 查询正常
+- 迁根后重新触发的新 run 成功创建：
+  - `e08354ab-8172-43f1-8a1a-84471ae58212`
+
+说明：
+
+- `/Users/kris/instances/vibe-team` 这套实例根已经可作为后续联调和常驻运行的标准形态
+- 旧的 `~/.openclaw-instances/vibe-team` 已可视为过渡目录，迁移完成后可删除

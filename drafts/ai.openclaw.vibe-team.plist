@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>ai.openclaw.vibe-team</string>
+    <key>Comment</key>
+    <string>OpenClaw Gateway (profile: vibe-team, v2026.3.1)</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>1</integer>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/opt/homebrew/Cellar/node/25.7.0/bin/node</string>
+      <string>/opt/homebrew/lib/node_modules/openclaw/dist/index.js</string>
+      <string>gateway</string>
+      <string>--port</string>
+      <string>18889</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/Users/kris/instances/vibe-team/state/logs/gateway.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/kris/instances/vibe-team/state/logs/gateway.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>HOME</key>
+      <string>/Users/kris</string>
+      <key>TMPDIR</key>
+      <string>/var/folders/6k/9_mv6stj5d962mcw8c5l6yw40000gp/T/</string>
+      <key>PATH</key>
+      <string>/Users/kris/.local/bin:/Users/kris/.npm-global/bin:/Users/kris/bin:/Users/kris/.volta/bin:/Users/kris/.asdf/shims:/Users/kris/.bun/bin:/Users/kris/Library/Application Support/fnm/aliases/default/bin:/Users/kris/.fnm/aliases/default/bin:/Users/kris/Library/pnpm:/Users/kris/.local/share/pnpm:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+      <key>NODE_EXTRA_CA_CERTS</key>
+      <string>/etc/ssl/cert.pem</string>
+      <key>OPENCLAW_PROFILE</key>
+      <string>vibe-team</string>
+      <key>OPENCLAW_STATE_DIR</key>
+      <string>/Users/kris/instances/vibe-team/state</string>
+      <key>OPENCLAW_CONFIG_PATH</key>
+      <string>/Users/kris/instances/vibe-team/config/openclaw.json</string>
+      <key>OPENCLAW_GATEWAY_PORT</key>
+      <string>18889</string>
+      <key>OPENCLAW_GATEWAY_TOKEN</key>
+      <string>REPLACE_WITH_OPENCLAW_GATEWAY_TOKEN</string>
+      <key>OPENCLAW_LAUNCHD_LABEL</key>
+      <string>ai.openclaw.vibe-team</string>
+      <key>OPENCLAW_SYSTEMD_UNIT</key>
+      <string>openclaw-gateway-vibe-team.service</string>
+      <key>OPENCLAW_SERVICE_MARKER</key>
+      <string>openclaw</string>
+      <key>OPENCLAW_SERVICE_KIND</key>
+      <string>gateway</string>
+      <key>OPENCLAW_SERVICE_VERSION</key>
+      <string>2026.3.1</string>
+    </dict>
+  </dict>
+</plist>

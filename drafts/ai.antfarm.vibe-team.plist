@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.antfarm.vibe-team</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/kris/instances/vibe-team/antfarm/dist/cli/cli.js</string>
+    <string>dashboard</string>
+    <string>start</string>
+    <string>--port</string>
+    <string>3333</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>/Users/kris/instances/vibe-team/antfarm</string>
+  <key>StandardOutPath</key>
+  <string>/Users/kris/instances/vibe-team/state/antfarm/launchd-dashboard.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/kris/instances/vibe-team/state/antfarm/launchd-dashboard.stderr.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/kris/instances/vibe-team/antfarm-home</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>OPENCLAW_PROFILE</key>
+    <string>vibe-team</string>
+    <key>OPENCLAW_STATE_DIR</key>
+    <string>/Users/kris/instances/vibe-team/state</string>
+    <key>OPENCLAW_CONFIG_PATH</key>
+    <string>/Users/kris/instances/vibe-team/config/openclaw.json</string>
+  </dict>
+</dict>
+</plist>

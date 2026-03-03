@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.spacebot.vibe-team</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/kris/instances/vibe-team/bin/run-spacebot-vibe-team.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>/Users/kris/instances/vibe-team</string>
+  <key>StandardOutPath</key>
+  <string>/Users/kris/instances/vibe-team/spacebot/spacebot.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/kris/instances/vibe-team/spacebot/spacebot.stderr.log</string>
+</dict>
+</plist>

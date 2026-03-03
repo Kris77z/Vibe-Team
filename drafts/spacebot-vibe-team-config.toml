@@ -1,0 +1,19 @@
+[llm.provider.openai-relay]
+api_type = "openai_completions"
+base_url = "https://ai.co.link/openai"
+api_key = "env:OPENAI_AUTH_KEY"
+
+[defaults.routing]
+channel = "openai-relay/gpt-5.1"
+branch = "openai-relay/gpt-5.1"
+worker = "openai-relay/gpt-5.1"
+compactor = "openai-relay/gpt-5.1"
+cortex = "openai-relay/gpt-5.1"
+
+[api]
+enabled = true
+bind = "127.0.0.1"
+port = 19898
+
+[[agents]]
+id = "pm"
