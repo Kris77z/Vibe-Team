@@ -11,7 +11,7 @@ import { logger } from "../lib/logger.js";
 import { sendSessionMessage } from "./gateway-api.js";
 import { getMaxRoleTimeoutSeconds } from "./install.js";
 import { loadWorkflowSpec } from "./workflow-spec.js";
-import { resolveWorkflowDir } from "./paths.js";
+import { resolveOpenClawConfigPath, resolveWorkflowDir } from "./paths.js";
 import { isFrontendChange } from "../lib/frontend-detect.js";
 import type { WorkflowStepFailure } from "./types.js";
 
@@ -51,6 +51,115 @@ export function parseOutputKeyValues(output: string): Record<string, string> {
   commitPending();
 
   return result;
+}
+
+type ReplyContractSet = {
+  defaultKeys: string[];
+  keysByStatus: Record<string, string[]>;
+};
+
+function addUniqueKeys(target: string[], keys: string[]) {
+  for (const key of keys) {
+    if (!target.includes(key)) target.push(key);
+  }
+}
+
+function finalizeReplyContract(
+  contracts: ReplyContractSet,
+  currentKeys: string[],
+  currentStatus: string | null
+) {
+  if (currentKeys.length === 0) return;
+  if (currentStatus) {
+    const existing = contracts.keysByStatus[currentStatus] ?? [];
+    contracts.keysByStatus[currentStatus] = [...existing];
+    addUniqueKeys(contracts.keysByStatus[currentStatus], currentKeys);
+    return;
+  }
+  addUniqueKeys(contracts.defaultKeys, currentKeys);
+}
+
+export function extractReplyContracts(template: string): ReplyContractSet {
+  const contracts: ReplyContractSet = { defaultKeys: [], keysByStatus: {} };
+  const lines = template.split("\n");
+  const replyIdx = lines.findIndex((line) => line.trim() === "Reply with:");
+  if (replyIdx === -1) return contracts;
+
+  let currentKeys: string[] = [];
+  let currentStatus: string | null = null;
+
+  for (let i = replyIdx + 1; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) continue;
+
+    if (/^Or if\b.*:$/i.test(trimmed)) {
+      finalizeReplyContract(contracts, currentKeys, currentStatus);
+      currentKeys = [];
+      currentStatus = null;
+      continue;
+    }
+
+    const keyMatch = trimmed.match(/^([A-Z_]+):\s*(.*)$/);
+    if (keyMatch) {
+      const key = keyMatch[1];
+      currentKeys.push(key);
+      if (key === "STATUS") {
+        const statusValue = keyMatch[2].trim().toLowerCase();
+        if (statusValue) currentStatus = statusValue;
+      }
+      continue;
+    }
+
+    if (currentKeys.length > 0 && !trimmed.startsWith("-")) {
+      break;
+    }
+  }
+
+  finalizeReplyContract(contracts, currentKeys, currentStatus);
+  return contracts;
+}
+
+function inferRequiredOutputKeys(template: string, output: string): string[] {
+  const contracts = extractReplyContracts(template);
+  const parsed = parseOutputKeyValues(output);
+  const status = parsed["status"]?.trim().toLowerCase();
+  if (status && contracts.keysByStatus[status]?.length) {
+    return contracts.keysByStatus[status];
+  }
+  if (contracts.defaultKeys.length > 0) {
+    return contracts.defaultKeys;
+  }
+  if (status) {
+    return contracts.keysByStatus[status] ?? [];
+  }
+
+  const variants = Object.values(contracts.keysByStatus);
+  if (variants.length === 1) {
+    return variants[0];
+  }
+  if (variants.length > 1) {
+    return variants.slice(1).reduce(
+      (shared, keys) => shared.filter((key) => keys.includes(key)),
+      [...variants[0]]
+    );
+  }
+  return [];
+}
+
+export function assertOutputMatchesReplyContract(template: string, output: string): void {
+  const requiredKeys = inferRequiredOutputKeys(template, output);
+  if (requiredKeys.length === 0) return;
+
+  const parsed = parseOutputKeyValues(output);
+  const presentKeys = new Set(Object.keys(parsed).map((key) => key.toUpperCase()));
+  if (output.includes("STORIES_JSON:")) {
+    presentKeys.add("STORIES_JSON");
+  }
+
+  const missingKeys = requiredKeys.filter((key) => !presentKeys.has(key));
+  if (missingKeys.length > 0) {
+    throw new Error(`Step output is missing required key(s): ${missingKeys.join(", ")}`);
+  }
 }
 
 /**
@@ -115,7 +224,7 @@ function findMissingTemplateKeys(template: string, context: Record<string, strin
  */
 function getAgentWorkspacePath(agentId: string): string | null {
   try {
-    const configPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
+    const configPath = resolveOpenClawConfigPath();
     const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
     const agent = config.agents?.list?.find((a: any) => a.id === agentId);
     return agent?.workspace ?? null;
@@ -385,15 +494,52 @@ export function cleanupAbandonedSteps(): void {
 
 // ── Frontend change detection ───────────────────────────────────────
 
+function gitRefExists(repo: string, ref: string): boolean {
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+      cwd: repo,
+      stdio: ["ignore", "ignore", "ignore"],
+      timeout: 10_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveFrontendDiffBase(repo: string): string | null {
+  for (const candidate of ["main", "master"]) {
+    if (gitRefExists(repo, candidate)) return candidate;
+  }
+
+  try {
+    const remoteHead = execFileSync("git", ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], {
+      cwd: repo,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
+    }).trim();
+    return remoteHead || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Compute whether a branch has frontend changes relative to main.
+ * Compute whether a branch has frontend changes relative to the repo's default base branch.
  * Returns 'true' or 'false' as a string for template context.
  */
 export function computeHasFrontendChanges(repo: string, branch: string): string {
+  if (!repo || !branch) return "false";
+
+  const baseRef = resolveFrontendDiffBase(repo);
+  if (!baseRef || !gitRefExists(repo, branch)) return "false";
+
   try {
-    const output = execFileSync("git", ["diff", "--name-only", `main..${branch}`], {
+    const output = execFileSync("git", ["diff", "--name-only", `${baseRef}..${branch}`], {
       cwd: repo,
       encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
       timeout: 10_000,
     });
     const files = output.trim().split("\n").filter(f => f.length > 0);
@@ -448,6 +594,47 @@ function runHasStories(runId: string): boolean {
 
 export type PeekResult = "HAS_WORK" | "NO_WORK";
 
+function findVerifyLoopStep(runId: string, verifyStepId: string): { id: string; step_id: string; status: string } | null {
+  const db = getDb();
+  const loopSteps = db.prepare(
+    "SELECT id, step_id, status, loop_config FROM steps WHERE run_id = ? AND type = 'loop'"
+  ).all(runId) as Array<{ id: string; step_id: string; status: string; loop_config: string | null }>;
+
+  for (const loopStep of loopSteps) {
+    if (!loopStep.loop_config) continue;
+    try {
+      const loopConfig: LoopConfig = JSON.parse(loopStep.loop_config);
+      if (loopConfig.verifyEach && loopConfig.verifyStep === verifyStepId) {
+        return { id: loopStep.id, step_id: loopStep.step_id, status: loopStep.status };
+      }
+    } catch {
+      // ignore malformed loop config here; normal claim path will fail later if needed
+    }
+  }
+
+  return null;
+}
+
+function canClaimPendingStep(step: { run_id: string; step_id: string; step_index: number }): boolean {
+  const db = getDb();
+  const verifyLoop = findVerifyLoopStep(step.run_id, step.step_id);
+  const prevSteps = db.prepare(
+    "SELECT step_id, status FROM steps WHERE run_id = ? AND step_index < ? ORDER BY step_index ASC"
+  ).all(step.run_id, step.step_index) as Array<{ step_id: string; status: string }>;
+
+  for (const prev of prevSteps) {
+    if (verifyLoop && prev.step_id === verifyLoop.step_id) {
+      if (verifyLoop.status !== "running") return false;
+      continue;
+    }
+    if (prev.status !== "done" && prev.status !== "skipped") {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 /**
  * Lightweight check: does this agent have any pending/waiting steps in active runs?
  * Unlike claimStep(), this runs a single cheap COUNT query — no cleanup, no context resolution.
@@ -455,13 +642,16 @@ export type PeekResult = "HAS_WORK" | "NO_WORK";
  */
 export function peekStep(agentId: string): PeekResult {
   const db = getDb();
-  const row = db.prepare(
-    `SELECT COUNT(*) as cnt FROM steps s
+  const rows = db.prepare(
+    `SELECT s.step_id, s.run_id, s.step_index
+     FROM steps s
      JOIN runs r ON r.id = s.run_id
-     WHERE s.agent_id = ? AND s.status IN ('pending', 'waiting')
-       AND r.status = 'running'`
-  ).get(agentId) as { cnt: number };
-  return row.cnt > 0 ? "HAS_WORK" : "NO_WORK";
+     WHERE s.agent_id = ? AND s.status = 'pending'
+       AND r.status = 'running'
+     ORDER BY s.step_index ASC, s.step_id ASC`
+  ).all(agentId) as Array<{ step_id: string; run_id: string; step_index: number }>;
+
+  return rows.some((step) => canClaimPendingStep(step)) ? "HAS_WORK" : "NO_WORK";
 }
 
 // ── Claim ───────────────────────────────────────────────────────────
@@ -491,25 +681,20 @@ export function claimStep(agentId: string): ClaimResult {
   }
   const db = getDb();
 
-  const step = db.prepare(
+  const candidates = db.prepare(
     `SELECT s.id, s.step_id, s.run_id, s.input_template, s.type, s.loop_config, s.step_index
      FROM steps s
      JOIN runs r ON r.id = s.run_id
      WHERE s.agent_id = ? AND s.status = 'pending'
        AND r.status NOT IN ('failed', 'cancelled')
-       AND NOT EXISTS (
-         SELECT 1 FROM steps prev
-         WHERE prev.run_id = s.run_id
-           AND prev.step_index < s.step_index
-           AND prev.status NOT IN ('done', 'skipped')
-       )
-    ORDER BY s.step_index ASC, s.step_id ASC
-     LIMIT 1`
-  ).get(agentId) as {
+     ORDER BY s.step_index ASC, s.step_id ASC`
+  ).all(agentId) as Array<{
     id: string; step_id: string; run_id: string; input_template: string; type: string;
     loop_config: string | null;
     step_index: number;
-  } | undefined;
+  }>;
+
+  const step = candidates.find((candidate) => canClaimPendingStep(candidate));
 
   if (!step) return { found: false };
 
@@ -680,10 +865,26 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   const db = getDb();
 
   const step = db.prepare(
-    "SELECT id, run_id, step_id, step_index, type, loop_config, current_story_id FROM steps WHERE id = ?"
-  ).get(stepId) as { id: string; run_id: string; step_id: string; step_index: number; type: string; loop_config: string | null; current_story_id: string | null } | undefined;
+    "SELECT id, run_id, step_id, step_index, input_template, status, type, loop_config, current_story_id FROM steps WHERE id = ?"
+  ).get(stepId) as {
+    id: string;
+    run_id: string;
+    step_id: string;
+    step_index: number;
+    input_template: string;
+    status: string;
+    type: string;
+    loop_config: string | null;
+    current_story_id: string | null;
+  } | undefined;
 
   if (!step) throw new Error(`Step not found: ${stepId}`);
+  if (step.status !== "running") {
+    return { advanced: false, runCompleted: false };
+  }
+  if (step.type === "loop" && !step.current_story_id) {
+    return { advanced: false, runCompleted: false };
+  }
 
   // Guard: don't process completions for failed runs
   const runCheck = db.prepare("SELECT status FROM runs WHERE id = ?").get(step.run_id) as { status: string } | undefined;
@@ -696,6 +897,7 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   const context: Record<string, string> = JSON.parse(run.context);
 
   // Parse KEY: value lines and merge into context
+  assertOutputMatchesReplyContract(step.input_template, output);
   const parsed = parseOutputKeyValues(output);
   for (const [key, value] of Object.entries(parsed)) {
     context[key] = value;

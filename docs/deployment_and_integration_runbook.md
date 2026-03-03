@@ -1393,3 +1393,431 @@ plan
    - `feature-dev-split` workflow 草案
 
 如果这 5 步走完，下一阶段就可以从“集成开发”转到“稳定交付能力建设”。
+
+---
+
+## 23. 2026-03-03 当前阻塞补充
+
+本节记录一次在真实实例上的最新联调结果。
+
+注意：
+
+- 这一节不是对前文“部署完成”的否定
+- 而是对当前阻塞点的补充说明
+- 截至本节记录时，系统尚未满足 `22.1` 中“workflow 能进入 terminal 状态”的验收标准
+
+### 23.1 当前现象
+
+当前实例：
+
+- `INSTANCE_ROOT=/Users/kris/instances/vibe-team`
+- `OpenClaw Gateway=127.0.0.1:18889`
+- `Antfarm Dashboard=127.0.0.1:3333`
+- `Spacebot=127.0.0.1:19898`
+
+在 `Spacebot` 中触发 workflow 后，run 可以成功创建，但 step 没有继续推进。
+
+实机检查结果：
+
+```bash
+"$ANT" workflow status b04b41cf
+```
+
+返回要点：
+
+- run 已创建
+- `Status: running`
+- 但首个 step 仍停在：
+  - `[pending] plan (feature-dev_planner)`
+- 后续 step 全部仍是：
+  - `[waiting]`
+
+这说明当前问题不是“run 创建失败”，而是“run 创建成功后，没有 agent 真正消费第一个 pending step”。
+
+### 23.2 Medic 当前状态
+
+实机检查：
+
+```bash
+"$ANT" medic status
+```
+
+返回结果：
+
+```text
+Antfarm Medic
+  Cron: not installed
+  Last check: never
+  Last 24h: 0 checks, 0 issues found, 0 auto-fixed
+```
+
+这意味着：
+
+- 当前实例上的 `Antfarm Medic` 尚未处于正常轮询状态
+- 至少从当前观测看，没有一个健康的 cron / medic 机制在推动 workflow step 前进
+
+### 23.3 当前日志观察
+
+`Antfarm dashboard` 的 bootstrap stderr：
+
+```bash
+tail -n 100 "$INSTANCE_ROOT/state/antfarm/launchd-dashboard.stderr.log"
+```
+
+当前没有有效报错输出。
+
+`OpenClaw gateway` stderr：
+
+```bash
+tail -n 100 "$INSTANCE_ROOT/state/logs/gateway.err.log"
+```
+
+可见重复报错，关键内容包括：
+
+- `exec host=sandbox is configured, but sandbox runtime is unavailable for this session`
+- `exec host not allowed (requested gateway; configure tools.exec.host=sandbox to allow)`
+- `exec host not allowed (requested node; configure tools.exec.host=sandbox to allow)`
+
+这说明当前除了 `medic/cron` 未安装外，`OpenClaw` 侧还存在 `tools.exec.host` 与 `sandbox` 配置不一致的问题。
+
+### 23.4 当前判断
+
+截至本节记录时，最合理的当前判断是：
+
+1. `Antfarm run` 创建链路本身是通的
+2. 但 `plan` step 没有被实际拉起执行
+3. 当前缺少健康的 `medic/cron` 轮询推进机制
+4. 同时 `OpenClaw` 的 `tools.exec` 配置存在运行时冲突
+
+因此：
+
+- 当前系统已经达到“能发起 run”
+- 但还没有达到“workflow 可持续推进到 terminal 状态”
+
+### 23.5 下一轮排查建议
+
+下一轮排查建议只聚焦两个方向，不要同时扩散：
+
+1. 先确认为什么 `Antfarm Medic` / cron 没有安装成功
+   - 是否 `install` 过程中没有真正落地
+   - 是否实例迁根后 `HOME` / wrapper / launch 方式导致 cron 安装位置失效
+   - 是否 `dashboard start` 的 daemon 模型没有连带恢复 medic 所需机制
+
+2. 再确认 `OpenClaw` 的 `tools.exec.host` / `sandbox` 配置为什么冲突
+   - 是否当前 `openclaw.json` 同时保留了互斥配置
+   - 是否 workflow agent 运行期请求了 `gateway` / `node`，但当前 profile 只允许 `sandbox`
+   - 是否当前会话缺少 sandbox runtime，导致 `exec` 无法真正执行
+
+在这两个问题明确前，不应把当前状态记录为“联调已完全跑通”。
+
+### 23.6 2026-03-03 当天后续修复结果
+
+上述阻塞在同一天的后续排障中已被实机解除。
+
+本次实机最终确认：
+
+- `feature-dev` workflow 不再停在“只能创建 run”
+- `plan pending` 问题已解除
+- `feature-dev` 的 story loop 已能真实推进：
+  - `plan -> setup -> implement -> verify -> test -> pr -> review`
+- smoke run `#7 / 8bc6e5c2-3d11-4a5a-afbc-4cff60a60498` 最终状态为：
+  - `Status: completed`
+
+本次闭环 run 的最终结果：
+
+- 所有 step 均为 `done`
+- 所有 stories `US-001` 到 `US-005` 均为 `done`
+- run 日志最终出现：
+  - `Run completed`
+
+因此：
+
+- 本实例现在已经满足第 `22.1` 节中“workflow 能进入 terminal 状态”的验收标准
+- 第 `23.1` 到 `23.5` 节应视为“当时阻塞快照”，不是当前最终状态
+
+### 23.7 本次最小修复的实际内容
+
+本次没有继续扩散做大改，而是只修了真正阻塞 workflow 推进的几类问题。
+
+#### 23.7.1 agent cron 必须走实例 wrapper，而不是裸 CLI
+
+实机验证表明，cron payload 若直接执行类似：
+
+```bash
+node .../antfarm/dist/cli/cli.js ...
+```
+
+会读到错误的 `HOME` / `OPENCLAW_STATE_DIR` / `OPENCLAW_CONFIG_PATH`，从而导致：
+
+- 读错实例状态
+- medic / cron 看起来“已装”但实际不推进正确 run
+
+本次修复后统一要求：
+
+- cron payload 优先走实例 wrapper：
+  - `/Users/kris/instances/vibe-team/bin/antfarm-vibe-team`
+
+#### 23.7.2 cron 必须使用 headless delivery
+
+CLI fallback 创建 cron 时，如果仍落到 `announce/last`，在没有 channel 的实例上会报：
+
+- `Channel is required`
+
+本次修复后统一要求：
+
+- agent cron 使用 `delivery.mode=none`
+- CLI fallback 创建 cron 时显式 `--no-deliver`
+
+#### 23.7.3 workflow agent 的 exec 必须与 gateway 实际能力一致
+
+本次实机阻塞的核心并不是 run 创建，而是 agent 执行面冲突：
+
+- 一部分会话默认走了 `sandbox`
+- 一部分会话回退到 `gateway` 时又用了错误安全级别
+
+本次实机确认后的可用口径是：
+
+- workflow agents 使用 `tools.exec.host = "gateway"`
+- `tools.exec.security = "full"`
+- `sandbox.mode = "off"`
+
+同时在 cron/work prompt 中明确要求：
+
+- Antfarm/OpenClaw CLI
+- `git`
+- `npm`
+- 本地 shell 命令
+
+都必须显式使用：
+
+- `host="gateway"`
+- `security="full"`
+
+不能再依赖模型默认推断。
+
+#### 23.7.4 planner 输出必须严格满足 reply contract
+
+本次还发现另一个“假推进”问题：
+
+- planner 可能输出了通用 `STATUS/CHANGES/TESTS`
+- 但没有真正产出 `REPO/BRANCH/STORIES_JSON`
+- 旧逻辑却仍可能把 step 判成 `done`
+
+本次修复后：
+
+- agent prompt 不再强灌统一完成模板
+- `step complete` 会校验 step 自身 `Reply with:` 契约
+- planner 缺 `REPO/BRANCH/STORIES_JSON` 时会被拒收
+
+这一步修完后，新的 smoke run 已能自动产出：
+
+- `REPO`
+- `BRANCH`
+- `STORIES_JSON`
+
+并自动推进到 `setup`
+
+#### 23.7.5 verify_each 与 loop completion 需要额外保护
+
+本次 story loop 闭环里还暴露了两个运行态问题：
+
+1. `verify_each` 在 loop step `running` 时无法正常 `peek/claim`
+2. 旧 developer 会话可能在 `current_story_id` 已清空后再次 `step complete`，把整条 loop 提前关掉
+
+本次修复后：
+
+- `verify_each` 可在 loop `running` 时正常 claim
+- loop step 在 `current_story_id` 为空时，不再接受 stale completion
+
+这两个修复是 story loop 能稳定从 `US-001` 跑到 `US-005` 的关键。
+
+### 23.8 本次 smoke run 的实际验证结论
+
+本次闭环 smoke run 在目标项目 `LobsterBoard` 上最终验证了三件事：
+
+1. workflow 不只是“能创建 run”，而是能真实推进到 terminal
+2. planner 产物已能被后续 step 消费
+3. 真实 repo 中可以完成一轮最小 smoke 交付并跑通验证
+
+本次在 `LobsterBoard` 分支 `chore/antfarm-smoke-002` 上落下的 smoke 交付物包括：
+
+- `planner-smoke` widget
+- `planner-smoke` custom page
+- smoke doc：
+  - `docs/antfarm-smoke-002.md`
+- `node:test` 覆盖
+
+实机验证通过：
+
+```bash
+node --test
+npm run build
+```
+
+### 23.9 当前仍然存在的剩余风险
+
+虽然本次已经完成 terminal 闭环，但仍有几类风险需要记录。
+
+#### 23.9.1 “完全零人工介入”还不能视为已稳定
+
+本次虽然最终跑到了 terminal，但后半段 terminal phase 为了快速收口，仍使用了 Antfarm 正常状态机接口做人工接管：
+
+- `step claim`
+- `step complete`
+
+也就是说：
+
+- “workflow 可闭环”已经成立
+- 但“每一轮都能完全无人值守闭环”还不应直接宣称为稳定结论
+
+#### 23.9.2 workflow spec 仍带有偏理想化验收模板
+
+`feature-dev` 的 planner / verify / review 模板里仍有一些对通用项目过强的假设，例如：
+
+- 默认要求 `Typecheck passes`
+- 默认要求 frontend visual verification
+- 默认要求真实 `gh pr create` / `gh pr review`
+
+这些对像 `LobsterBoard` 这种：
+
+- 无 `typecheck`
+- 无真实 PR 需求
+- smoke-only 目标
+
+的任务并不总是贴合。
+
+因此下一步最值得做的是：
+
+- 收敛 `feature-dev` 各 step 的默认契约
+- 把“smoke-only / no-real-PR / no-typecheck-project”这类条件显式参数化
+
+#### 23.9.3 progress 文件路径假设仍不够统一
+
+本次 developer fallback 过程中还暴露出一个旧假设：
+
+- agent 会默认从目标 repo 根读取 `progress-<run>.txt`
+
+但实际 workflow workspace、目标 repo、实例状态目录三者并不总是同一路径模型。
+
+这不会再阻塞当前实例推进，但属于后续应继续收敛的运行面问题。
+
+#### 23.9.4 `agent-browser` 已实机打通，browser review 路径已从“可选 fallback”变为“可真实执行”
+
+在后续 UI smoke 验证中，`feature-dev` 的 `verifier` / `reviewer` 已改为使用官方 `agent-browser` skill：
+
+- `https://github.com/vercel-labs/agent-browser/blob/main/skills/agent-browser/SKILL.md`
+
+本次实机确认了三层状态：
+
+1. workflow 已为 `verifier` / `reviewer` 声明 `agent-browser`
+2. live instance 已把官方 skill provision 到对应 workspace
+3. Playwright Chromium 运行时也已通过代理下载完成，`agent-browser` 不再停留在“只有 SKILL.md，没有 browser runtime”
+
+本次 browser smoke 的 live 证据是：
+
+- smoke run：
+  - `#10 / cd272a28-09ee-48f1-8252-acf96a50a6e1`
+- verifier screenshot：
+  - `/tmp/cd272a28-verify.png`
+- reviewer screenshot：
+  - `/tmp/cd272a28-review.png`
+
+该 run 已实机确认：
+
+- `verify` 输入中 `Has frontend changes: true`
+- `review` 输入中 `Has frontend changes: true`
+- `agent-browser` 能真实打开：
+  - `file:///Users/kris/Desktop/Dev/LobsterBoard/pages/planner-smoke/index.html`
+- 页面中新增的可视化目标文案已被浏览器渲染并读到：
+  - `Browser verification target ready`
+
+因此：
+
+- 当前实例已经具备真实 browser verification / visual review 能力
+- “browser tool 不可用，所以只能 fallback 到代码检查”不再是当前 live 实例的主要限制
+
+#### 23.9.5 当前自动调度面的更准确剩余风险：cron job 已创建，但 `feature-dev` agent 仍可能因缺失 `tools.exec` 配置而在 `step peek` 自阻塞
+
+在 `#10` 的后续排查中，实机确认：
+
+- live instance 的 cron job 注册文件已经存在：
+  - `/Users/kris/instances/vibe-team/state/cron/jobs.json`
+- `feature-dev` 的 planner / setup / developer / verifier / tester / reviewer jobs 都已经写入 jobs.json
+
+但同一时间，live `openclaw.json` 里 `feature-dev_*` agent 条目仍存在一个更隐蔽的问题：
+
+- agent 条目里虽然保留了：
+  - `deny: ["gateway", ...]`
+- 却没有像 `bug-fix_*` / `security-audit_*` 那样显式写入：
+  - `tools.exec.host = "gateway"`
+  - `tools.exec.security = "full"`
+  - `tools.exec.ask = "off"`
+
+这会导致 cron session 实际运行时在最开始的 `step peek` 就报：
+
+- `exec host not allowed (requested gateway; configure tools.exec.host=sandbox to allow)`
+
+因此当前更准确的结论是：
+
+- “cron 没创建”不是当前根因
+- “cron job 已创建，但 `feature-dev` agent 缺少显式 `tools.exec` 配置，导致自动 poller 在 peek 阶段自阻塞”才是当前调度面的主要剩余风险
+
+这一点解释了为什么：
+
+- jobs.json 里已经有 `feature-dev` poller
+- 但新 run 仍可能长时间停在 `plan pending`
+- 人工 `step claim/complete` 仍然能推进，因为坏的不是状态机本身，而是 cron agent 的本地 CLI 可执行能力
+
+后续修复原则应明确为：
+
+- 安装 workflow 时，所有依赖本地 Antfarm/OpenClaw CLI、`git`、`npm` 的 workflow agents，都必须显式写入 `tools.exec`
+- 不能只依赖 role/profile，而不把 `exec.host/security` 实际落进 agent config
+
+#### 23.9.6 上述 `tools.exec` 缺口修复后的 live 回归结果
+
+在继续排障后，已对 installer 做进一步修复：
+
+- workflow install 现在会为 workflow agents 显式写入：
+  - `tools.exec.host = "gateway"`
+  - `tools.exec.security = "full"`
+  - `tools.exec.ask = "off"`
+
+随后在 live instance 上重新安装 `feature-dev`，并再次核对：
+
+- `feature-dev_planner`
+- `feature-dev_setup`
+- `feature-dev_developer`
+- `feature-dev_verifier`
+- `feature-dev_tester`
+- `feature-dev_reviewer`
+
+这些 agent 在 live `openclaw.json` 中都已带上上述 `tools.exec` 配置。
+
+修复后的自动调度回归验证：
+
+- 重新创建 `feature-dev` cron jobs
+- 启动新的 smoke run：
+  - `#11 / 88820962-978e-4eec-bb19-82282c454c61`
+- 本轮**没有人工 `step claim`**
+
+live 结果显示：
+
+- `07:08 PM [88820962] planner Claimed step`
+- `07:10 PM [88820962] Step completed`
+- `07:10 PM [88820962] setup Claimed step`
+- `07:10 PM [88820962] Step completed`
+
+对应 planner cron 新 job 文件中也已经出现成功执行记录，说明新 cron session 已能跨过原来的 `step peek` / `gateway exec` 阻塞并真正消费 work：
+
+- `/Users/kris/instances/vibe-team/state/cron/runs/2ab9003c-ca1b-4189-937a-686692e64860.jsonl`
+
+该 run 在无人手动 claim 的情况下，已自动推进到：
+
+- `plan done`
+- `setup done`
+- `implement pending`
+
+因此：
+
+- “feature-dev 新 run 会长期停在 `plan pending`”这一问题，在修复 live agent `tools.exec` 配置后已被实机解除
+- 当前剩余的不确定性不再是 `plan/setup` 自动推进，而是更后续阶段是否还会暴露新的 repo/task 特定问题

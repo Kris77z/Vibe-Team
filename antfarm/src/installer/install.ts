@@ -177,6 +177,11 @@ function buildToolsConfig(role: AgentRole): Record<string, unknown> {
   if (defaults.profile) tools.profile = defaults.profile;
   if (defaults.alsoAllow?.length) tools.alsoAllow = defaults.alsoAllow;
   tools.deny = defaults.deny;
+  tools.exec = {
+    host: "gateway",
+    security: "full",
+    ask: "off",
+  };
   return tools;
 }
 

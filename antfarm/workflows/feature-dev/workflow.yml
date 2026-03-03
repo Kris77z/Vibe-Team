@@ -99,9 +99,10 @@ steps:
       3. Order by dependency: schema/DB first, backend, frontend, integration
       4. Each story must fit in one developer session (one context window)
       5. Every acceptance criterion must be mechanically verifiable
-      6. Always include "Typecheck passes" as the last criterion in every story
-      7. Every story MUST include test criteria — "Tests for [feature] pass"
+      6. Only include a dedicated "Typecheck passes" criterion when the repo clearly has a real typecheck/static-analysis command; do not invent one for plain JS or repos without that tooling
+      7. Every story MUST include test criteria, but match the repo's actual tooling (for example `node --test`, an existing test script, or another real command)
       8. The developer is expected to write tests as part of each story
+      9. If the task is explicitly smoke-only, low-risk, or says no real PR is required, keep stories minimal and avoid inventing production-only deliverables
 
       Reply with:
       STATUS: done
@@ -127,16 +128,20 @@ steps:
       Instructions:
       1. cd into the repo
       2. Create the feature branch (git checkout -b {{branch}})
-      3. Read package.json, CI config, test config to understand the build/test setup
+      3. Read package.json, CI config, and test config to understand the build/test/typecheck setup
       4. Ensure .gitignore exists — if missing, create one appropriate for the detected stack (must include .env, node_modules/, *.key, *.pem at minimum)
       5. Run the build to establish a baseline
       6. Run the tests to establish a baseline
-      7. Report what you found
+      7. Detect whether the repo has a dedicated typecheck/static-analysis command; if none exists, report TYPECHECK_CMD: none
+      8. If the task explicitly says no real PR is required, smoke-only, or otherwise should not touch GitHub, report PR_MODE: skip; otherwise report PR_MODE: create
+      9. Report what you found
 
       Reply with:
       STATUS: done
       BUILD_CMD: <build command>
       TEST_CMD: <test command>
+      TYPECHECK_CMD: <typecheck command or none>
+      PR_MODE: <create or skip>
       CI_NOTES: <brief CI notes>
       BASELINE: <baseline status>
     expects: "STATUS: done"
@@ -163,6 +168,7 @@ steps:
       BRANCH: {{branch}}
       BUILD_CMD: {{build_cmd}}
       TEST_CMD: {{test_cmd}}
+      TYPECHECK_CMD: {{typecheck_cmd}}
 
       CURRENT STORY:
       {{current_story}}
@@ -183,11 +189,12 @@ steps:
       2. Pull latest on the branch
       3. Implement this story only
       4. Write tests for this story's functionality
-      5. Run typecheck / build
+      5. If TYPECHECK_CMD is not "none" and not empty, run it; otherwise do not invent a typecheck step
       6. Run tests to confirm they pass
-      7. Commit: feat: {{current_story_id}} - {{current_story_title}}
-      8. Rewrite progress-{{run_id}}.txt with updated story results and patterns
-      9. Update Codebase Patterns if you found reusable patterns
+      7. Run the build command to confirm the story still builds
+      8. Commit: feat: {{current_story_id}} - {{current_story_title}}
+      9. Rewrite progress-{{run_id}}.txt with updated story results and patterns
+      10. Update Codebase Patterns if you found reusable patterns
 
       Reply with:
       STATUS: done
@@ -210,6 +217,7 @@ steps:
       BRANCH: {{branch}}
       CHANGES: {{changes}}
       TEST_CMD: {{test_cmd}}
+      TYPECHECK_CMD: {{typecheck_cmd}}
 
       CURRENT STORY:
       {{current_story}}
@@ -223,12 +231,12 @@ steps:
       3. Tests were written for this story's functionality
       4. Tests pass (run {{test_cmd}})
       5. No obvious incomplete work
-      6. Typecheck passes
+      6. If TYPECHECK_CMD is not "none" and not empty, it passes; otherwise treat "no dedicated typecheck command exists" as expected and do not fail solely for that
 
       ## Visual Verification (Frontend Changes)
       Has frontend changes: {{has_frontend_changes}}
 
-      If {{has_frontend_changes}} is 'true', you MUST also perform visual verification:
+      If {{has_frontend_changes}} is 'true', perform visual verification when the changed UI can realistically be opened in the current environment:
       1. Use the agent-browser skill to visually inspect the changed UI
       2. Open the changed HTML file directly (file:// URL) or spin up a local dev server if the project requires one
       3. Take a screenshot of the rendered page
@@ -240,7 +248,8 @@ steps:
          - Text is readable and not clipped or hidden
       5. A visual PASS means: the page renders without broken layout, missing elements, or overlapping content
       6. A visual FAIL means: broken layout, missing/invisible elements, overlapping or misaligned content, unstyled raw HTML, or obvious rendering errors
-      7. Include your visual findings in VERIFIED output
+      7. If visual verification is not practical in the current environment, explicitly say so in VERIFIED and fall back to code/file inspection; do not fail solely because a browser tool is unavailable
+      8. Include your visual findings in VERIFIED output
 
       If {{has_frontend_changes}} is 'false', skip visual verification entirely.
 
@@ -272,16 +281,18 @@ steps:
       CHANGES: {{changes}}
       BUILD_CMD: {{build_cmd}}
       TEST_CMD: {{test_cmd}}
+      TYPECHECK_CMD: {{typecheck_cmd}}
 
       PROGRESS LOG:
       {{progress}}
 
       Your job (integration/E2E testing — unit tests were already written per-story):
       1. Run the full test suite ({{test_cmd}}) to confirm everything passes together
-      2. Look for integration issues between stories
-      3. If this is a UI feature, use agent-browser to test it end-to-end
-      4. Check cross-cutting concerns: error handling, edge cases across features
-      5. Verify the overall feature works as a cohesive whole
+      2. If TYPECHECK_CMD is not "none" and not empty, run it too
+      3. Look for integration issues between stories
+      4. If this is a UI feature and a browser-capable path is practical, use agent-browser to test it end-to-end
+      5. Check cross-cutting concerns: error handling, edge cases across features
+      6. Verify the overall feature works as a cohesive whole
 
       Reply with:
       STATUS: done
@@ -310,16 +321,22 @@ steps:
       BRANCH: {{branch}}
       CHANGES: {{changes}}
       RESULTS: {{results}}
+      PR_MODE: {{pr_mode}}
 
       PROGRESS LOG:
       {{progress}}
 
-      Create a PR with:
-      - Clear title summarizing the change
-      - Description explaining what and why
-      - Reference to what was tested
+      If PR_MODE is "skip":
+      - Do NOT call GitHub CLI
+      - Reply with:
+        STATUS: done
+        PR: skipped (task explicitly does not require a real PR)
 
-      Use: gh pr create
+      Otherwise:
+      - Create a PR with a clear title summarizing the change
+      - Add a description explaining what and why
+      - Reference what was tested
+      - Use: gh pr create
 
       Reply with:
       STATUS: done
@@ -334,6 +351,7 @@ steps:
       Review the pull request.
 
       PR: {{pr}}
+      PR_MODE: {{pr_mode}}
       TASK: {{task}}
       CHANGES: {{changes}}
 
@@ -346,16 +364,21 @@ steps:
       - Test coverage
       - Follows project conventions
 
-      Use: gh pr view, gh pr diff to read the PR.
+      If PR_MODE is "skip" or PR starts with "skipped":
+      - Do a repo-level final review instead of a GitHub PR review
+      - Do NOT call gh pr view / gh pr review
+      - Base your decision on the branch diff, tests, and progress log
 
-      IMPORTANT: Post your review to the PR on GitHub using:
-      - If approving: gh pr review <number> --approve --body "your review summary"
-      - If requesting changes: gh pr review <number> --request-changes --body "your feedback"
+      Otherwise:
+      - Use: gh pr view, gh pr diff to read the PR
+      - Post your review to GitHub using:
+        - If approving: gh pr review <number> --approve --body "your review summary"
+        - If requesting changes: gh pr review <number> --request-changes --body "your feedback"
 
       ## Visual Review (Frontend Changes)
       Has frontend changes: {{has_frontend_changes}}
 
-      If {{has_frontend_changes}} is 'true', you MUST also perform a visual design review:
+      If {{has_frontend_changes}} is 'true', perform a visual design review when the changed UI can realistically be opened in the current environment:
       1. Check out the branch: git checkout {{branch}}
       2. Use the agent-browser skill to open the changed page (file:// URL or local dev server)
       3. Take a screenshot of the rendered page
@@ -366,7 +389,8 @@ steps:
          - Do interactive elements look clickable/tappable?
          - Is the overall design cohesive — does it feel like part of the same product?
       5. This is a DESIGN review, not a structural check — the verify step already confirmed elements render. You are checking whether the result looks GOOD.
-      6. Include your visual design assessment in the review output
+      6. If visual review is not practical in the current environment, explicitly say so and fall back to code/file review; do not fail solely because a browser tool is unavailable
+      7. Include your visual design assessment in the review output
 
       If {{has_frontend_changes}} is 'false', skip visual review entirely.
 

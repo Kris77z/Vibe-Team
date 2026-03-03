@@ -6,6 +6,29 @@ import { logger } from "../lib/logger.js";
 import { ensureWorkflowCrons } from "./agent-cron.js";
 import { emitEvent } from "./events.js";
 
+function extractStructuredTaskContext(task: string): Record<string, string> {
+  const context: Record<string, string> = {};
+
+  for (const line of task.split("\n")) {
+    const match = line.match(/^([A-Z_]+):\s*(.+)$/);
+    if (!match) continue;
+
+    const key = match[1].toLowerCase();
+    const value = match[2].trim();
+    if (!value) continue;
+    context[key] = value;
+  }
+
+  if (!context.repo && context.repo_path) {
+    context.repo = context.repo_path;
+  }
+  if (!context.branch && context.git_branch) {
+    context.branch = context.git_branch;
+  }
+
+  return context;
+}
+
 export async function runWorkflow(params: {
   workflowId: string;
   taskTitle: string;
@@ -20,6 +43,7 @@ export async function runWorkflow(params: {
 
   const initialContext: Record<string, string> = {
     task: params.taskTitle,
+    ...extractStructuredTaskContext(params.taskTitle),
     ...workflow.context,
   };
 

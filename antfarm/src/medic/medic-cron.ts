@@ -2,7 +2,7 @@
  * Medic cron management — install/uninstall the medic's periodic check cron job.
  */
 import { createAgentCronJob, deleteCronJob, listCronJobs } from "../installer/gateway-api.js";
-import { resolveAntfarmCli } from "../installer/paths.js";
+import { resolveAntfarmCliCommand } from "../installer/paths.js";
 import { readOpenClawConfig, writeOpenClawConfig } from "../installer/openclaw-config.js";
 
 const MEDIC_CRON_NAME = "antfarm/medic";
@@ -11,12 +11,12 @@ const MEDIC_MODEL = "default";
 const MEDIC_TIMEOUT_SECONDS = 120;
 
 function buildMedicPrompt(): string {
-  const cli = resolveAntfarmCli();
+  const cli = resolveAntfarmCliCommand();
   return `You are the Antfarm Medic — a health watchdog for workflow runs.
 
 Run the medic check:
 \`\`\`
-node ${cli} medic run --json
+${cli} medic run --json
 \`\`\`
 
 If the check output contains "issuesFound": 0, reply HEARTBEAT_OK and stop.

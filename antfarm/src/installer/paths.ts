@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,6 +56,25 @@ export function resolveRunRoot(): string {
 }
 
 export function resolveAntfarmCli(): string {
+  const env = process.env.ANTFARM_CLI_PATH?.trim();
+  if (env) {
+    return env;
+  }
+
+  const configPath = process.env.OPENCLAW_CONFIG_PATH?.trim();
+  if (configPath) {
+    const instanceCli = path.resolve(path.dirname(configPath), "..", "bin", "antfarm-vibe-team");
+    if (fs.existsSync(instanceCli)) {
+      return instanceCli;
+    }
+  }
+
   // From dist/installer/paths.js -> ../../dist/cli/cli.js
   return path.resolve(__dirname, "..", "cli", "cli.js");
+}
+
+export function resolveAntfarmCliCommand(): string {
+  const cli = resolveAntfarmCli();
+  const quoted = JSON.stringify(cli);
+  return cli.endsWith(".js") ? `node ${quoted}` : quoted;
 }

@@ -43,6 +43,21 @@ describe("computeHasFrontendChanges", () => {
     assert.equal(computeHasFrontendChanges(tmpDir, "nonexistent-branch"), "false");
   });
 
+  it("uses master when main does not exist", () => {
+    const masterDir = fs.mkdtempSync(path.join(os.tmpdir(), "antfarm-test-master-"));
+    try {
+      execSync("git init && git checkout -b master", { cwd: masterDir });
+      fs.writeFileSync(path.join(masterDir, "README.md"), "# test");
+      execSync("git add . && git commit -m 'init'", { cwd: masterDir });
+      execSync("git checkout -b feat-ui", { cwd: masterDir });
+      fs.writeFileSync(path.join(masterDir, "index.html"), "<html></html>");
+      execSync("git add . && git commit -m 'add html'", { cwd: masterDir });
+      assert.equal(computeHasFrontendChanges(masterDir, "feat-ui"), "true");
+    } finally {
+      fs.rmSync(masterDir, { recursive: true, force: true });
+    }
+  });
+
   it("detects CSS changes in frontend directories", () => {
     execSync("git checkout -b feat-styles", { cwd: tmpDir });
     fs.mkdirSync(path.join(tmpDir, "styles"), { recursive: true });

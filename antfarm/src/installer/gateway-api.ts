@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { execFile } from "node:child_process";
+import { resolveOpenClawConfigPath } from "./paths.js";
 
 interface GatewayConfig {
   url: string;
@@ -17,7 +18,7 @@ async function readOpenClawConfig(): Promise<{
   authMode?: "token" | "password";
   password?: string;
 }> {
-  const configPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
+  const configPath = resolveOpenClawConfigPath();
   try {
     const content = await fs.readFile(configPath, "utf-8");
     const config = JSON.parse(content);
@@ -158,6 +159,8 @@ export async function createAgentCronJob(job: {
 
     if (job.delivery?.mode === "announce") {
       args.push("--announce");
+    } else {
+      args.push("--no-deliver");
     }
 
     if (!job.enabled) {

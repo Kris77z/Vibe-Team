@@ -1,6 +1,6 @@
 import { createAgentCronJob, deleteAgentCronJobs, listCronJobs, checkCronToolAvailable } from "./gateway-api.js";
 import type { WorkflowSpec } from "./types.js";
-import { resolveAntfarmCli } from "./paths.js";
+import { resolveAntfarmCliCommand } from "./paths.js";
 import { getDb } from "../db.js";
 import { readOpenClawConfig } from "./openclaw-config.js";
 
@@ -9,7 +9,7 @@ const DEFAULT_AGENT_TIMEOUT_SECONDS = 30 * 60; // 30 minutes
 
 function buildAgentPrompt(workflowId: string, agentId: string): string {
   const fullAgentId = `${workflowId}_${agentId}`;
-  const cli = resolveAntfarmCli();
+  const cli = resolveAntfarmCliCommand();
 
   return `You are an Antfarm workflow agent. Check for pending work and execute it.
 
@@ -17,7 +17,7 @@ function buildAgentPrompt(workflowId: string, agentId: string): string {
 
 Step 1 — Check for pending work:
 \`\`\`
-node ${cli} step claim "${fullAgentId}"
+${cli} step claim "${fullAgentId}"
 \`\`\`
 
 If output is "NO_WORK", reply HEARTBEAT_OK and stop.
@@ -26,21 +26,24 @@ Step 2 — If JSON is returned, it contains: {"stepId": "...", "runId": "...", "
 Save the stepId — you'll need it to report completion.
 The "input" field contains your FULLY RESOLVED task instructions. Read it carefully and DO the work.
 
-Step 3 — Do the work described in the input. Format your output with KEY: value lines as specified.
+Step 3 — Do the work described in the input.
+Before reporting completion, find the "Reply with:" section inside the claimed step input and mirror that schema exactly.
+Different steps require different keys. NEVER default to STATUS/CHANGES/TESTS unless the claimed step explicitly requires them.
+When using the exec tool for Antfarm/OpenClaw CLI, git, npm, or other local shell commands in this workflow, explicitly set exec host to "gateway" and exec security to "full". Never request sandbox host or allowlist security for these commands.
 
 Step 4 — MANDATORY: Report completion (do this IMMEDIATELY after finishing the work):
 \`\`\`
 cat <<'ANTFARM_EOF' > /tmp/antfarm-step-output.txt
-STATUS: done
-CHANGES: what you did
-TESTS: what tests you ran
+<paste the exact KEY: VALUE output required by the claimed step here>
 ANTFARM_EOF
-cat /tmp/antfarm-step-output.txt | node ${cli} step complete "<stepId>"
+cat /tmp/antfarm-step-output.txt | ${cli} step complete "<stepId>"
 \`\`\`
+
+If "step complete" rejects the payload because keys are missing, fix the payload and retry in the same session.
 
 If the work FAILED:
 \`\`\`
-node ${cli} step fail "<stepId>" "description of what went wrong"
+${cli} step fail "<stepId>" "description of what went wrong"
 \`\`\`
 
 RULES:
@@ -53,7 +56,7 @@ The workflow cannot advance until you report. Your session ending without report
 
 export function buildWorkPrompt(workflowId: string, agentId: string): string {
   const fullAgentId = `${workflowId}_${agentId}`;
-  const cli = resolveAntfarmCli();
+  const cli = resolveAntfarmCliCommand();
 
   return `You are an Antfarm workflow agent. Execute the pending work below.
 
@@ -63,21 +66,24 @@ The claimed step JSON is provided below. It contains: {"stepId": "...", "runId":
 Save the stepId — you'll need it to report completion.
 The "input" field contains your FULLY RESOLVED task instructions. Read it carefully and DO the work.
 
-Do the work described in the input. Format your output with KEY: value lines as specified.
+Do the work described in the input.
+Before reporting completion, find the "Reply with:" section inside the claimed step input and mirror that schema exactly.
+Different steps require different keys. NEVER default to STATUS/CHANGES/TESTS unless the claimed step explicitly requires them.
+When using the exec tool for Antfarm/OpenClaw CLI, git, npm, or other local shell commands in this workflow, explicitly set exec host to "gateway" and exec security to "full". Never request sandbox host or allowlist security for these commands.
 
 MANDATORY: Report completion (do this IMMEDIATELY after finishing the work):
 \`\`\`
 cat <<'ANTFARM_EOF' > /tmp/antfarm-step-output.txt
-STATUS: done
-CHANGES: what you did
-TESTS: what tests you ran
+<paste the exact KEY: VALUE output required by the claimed step here>
 ANTFARM_EOF
-cat /tmp/antfarm-step-output.txt | node ${cli} step complete "<stepId>"
+cat /tmp/antfarm-step-output.txt | ${cli} step complete "<stepId>"
 \`\`\`
+
+If "step complete" rejects the payload because keys are missing, fix the payload and retry in the same session.
 
 If the work FAILED:
 \`\`\`
-node ${cli} step fail "<stepId>" "description of what went wrong"
+${cli} step fail "<stepId>" "description of what went wrong"
 \`\`\`
 
 RULES:
@@ -127,19 +133,19 @@ async function resolveAgentCronModel(agentId: string, requestedModel?: string): 
 
 export function buildPollingPrompt(workflowId: string, agentId: string, workModel?: string): string {
   const fullAgentId = `${workflowId}_${agentId}`;
-  const cli = resolveAntfarmCli();
+  const cli = resolveAntfarmCliCommand();
   const model = workModel ?? "default";
   const workPrompt = buildWorkPrompt(workflowId, agentId);
 
   return `Step 1 — Quick check for pending work (lightweight, no side effects):
 \`\`\`
-node ${cli} step peek "${fullAgentId}"
+${cli} step peek "${fullAgentId}"
 \`\`\`
 If output is "NO_WORK", reply HEARTBEAT_OK and stop immediately. Do NOT run step claim.
 
 Step 2 — If "HAS_WORK", claim the step:
 \`\`\`
-node ${cli} step claim "${fullAgentId}"
+${cli} step claim "${fullAgentId}"
 \`\`\`
 If output is "NO_WORK", reply HEARTBEAT_OK and stop.
 
@@ -148,6 +154,10 @@ Then call sessions_spawn with these parameters:
 - agentId: "${fullAgentId}"
 - model: "${model}"
 - task: The full work prompt below, followed by "\\n\\nCLAIMED STEP JSON:\\n" and the exact JSON output from step claim.
+
+If sessions_spawn is unavailable, rejected, or fails for any reason, DO NOT stop.
+Instead, continue in the current cron session and execute the claimed step yourself using the exact same work prompt and claimed-step JSON below.
+In that fallback path, you must still call step complete or step fail before ending the session.
 
 Full work prompt to include in the spawned task:
 ---START WORK PROMPT---
