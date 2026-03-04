@@ -17,6 +17,7 @@ describe("two-phase-integration", () => {
       // Phase 2 should use the specified work model via sessions_spawn
       assert.ok(prompt.includes("anthropic/claude-opus-4-6"), "work model in sessions_spawn");
       assert.ok(prompt.includes("sessions_spawn"), "should trigger sessions_spawn for Phase 2");
+      assert.ok(prompt.includes('runtime: "subagent"'), "should pin sessions_spawn to native subagent runtime");
     });
 
     it("polling prompt embeds the full work prompt for Phase 2 execution", () => {

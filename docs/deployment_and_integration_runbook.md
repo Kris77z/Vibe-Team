@@ -1821,3 +1821,85 @@ live 结果显示：
 
 - “feature-dev 新 run 会长期停在 `plan pending`”这一问题，在修复 live agent `tools.exec` 配置后已被实机解除
 - 当前剩余的不确定性不再是 `plan/setup` 自动推进，而是更后续阶段是否还会暴露新的 repo/task 特定问题
+
+#### 23.9.7 权限分离回归后的 live 结论：`__cron` helper 已能无人值守推进 `plan -> setup`，但真实 worker 仍暴露出新的执行面约束
+
+在开发机 code review 指出“不能把所有真实 workflow 角色都直接升级成 `gateway/full/ask=off` exec”之后，对 `feature-dev` 做了进一步收敛：
+
+- 真实 workflow agents 继续保留按角色收紧的工具策略
+- 新增独立的 `feature-dev_*__cron` helper agents
+- 只有这些 `__cron` helper agents 持有：
+  - `tools.exec.host = "gateway"`
+  - `tools.exec.security = "full"`
+  - `tools.exec.ask = "off"`
+- cron job 的 `agentId` 也切换为：
+  - `feature-dev_planner__cron`
+  - `feature-dev_setup__cron`
+  - `feature-dev_developer__cron`
+  - `feature-dev_verifier__cron`
+  - `feature-dev_tester__cron`
+  - `feature-dev_reviewer__cron`
+
+本轮 live 验证过程中，实机又暴露出三层此前被旧 fallback 掩盖的执行面问题：
+
+1. 新建的 `__cron` helper agent 若未显式写入 `sandbox.mode = "off"`，`sessions_spawn` 会先被 sandbox 继承策略拦住
+2. polling prompt 若不显式指定 `runtime: "subagent"`，模型会把 worker handoff 误走到 ACP 语义，报：
+   - `ACP runtime backend is not configured. Install and enable the acpx runtime plugin.`
+3. worker work prompt 若硬性要求 `exec host = "gateway"`，真实 workflow agent 会因为未授予 gateway host 而在执行 repo 命令时自阻塞；对 worker 更合理的约束是：
+   - 使用当前 agent 的默认 exec policy
+   - 不在 prompt 里强推 `gateway/full`
+
+修完上述三点后，重新同步 live instance、重建 `feature-dev` crons，并启动新的无人值守回归：
+
+- `#17 / 6dfeca7d-ad44-4873-9e27-cc5c2ae19093`
+
+本轮**没有人工 `step claim`**，初始 live 结果为：
+
+- `08:24 AM [6dfeca7d] planner Claimed step`
+- `08:26 AM [6dfeca7d] Step completed`
+- `08:26 AM [6dfeca7d] Pipeline advanced`
+- `08:30 AM [6dfeca7d] setup Claimed step`
+- `08:30 AM [6dfeca7d] Step completed`
+- `08:30 AM [6dfeca7d] Pipeline advanced`
+
+对应状态先自动推进到：
+
+- `plan done`
+- `setup done`
+- `implement pending`
+
+随后在 `US-001` 完成后，live 又暴露出一个新的运行面现象：
+
+- `feature-dev_verifier__cron` 在 `jobs.json` 里残留了 `runningAtMs`
+- 导致 `verify pending` 没被继续捡起
+- 通过一次：
+  - `launchctl kickstart -k gui/$(id -u)/ai.openclaw.vibe-team`
+  - 清理掉卡住的 cron runtime 后，`#17` 又继续自动向前推进
+
+重启后，`#17` 继续出现：
+
+- `08:35 AM [6dfeca7d] developer Claimed step`
+- `08:35 AM [6dfeca7d] developer Story started — US-001`
+- `08:37 AM [6dfeca7d] Story done — US-001`
+- `08:40 AM [6dfeca7d] verifier Claimed step`
+- `08:41 AM [6dfeca7d] Story verified`
+
+因此可以把当前 live 结论更新为：
+
+- `feature-dev` 在“cron helper 与真实 workflow role 分离”的前提下，已经再次实机证明可在**无人手工 claim**下自动推进
+- 当前至少已连续自动跨过：
+  - `plan -> setup`
+  - `implement(US-001) -> verify(US-001)`
+- 这说明权限分离后的核心推进链仍然成立，而不是只在旧的“所有角色都拿 gateway/full exec”模型下才成立
+
+但也要明确保留当前剩余风险：
+
+- 这轮 `#17` 目前仍未在新的权限分离模型下再次完整跑到 terminal
+- live gateway 在重建 cron job 时出现过一次瞬时超时：
+  - `gateway timeout after 120ms`
+  - 通过 `launchctl kickstart -k gui/$(id -u)/ai.openclaw.vibe-team` 后恢复
+- live cron runtime 也出现过一次 `runningAtMs` 残留，需要同样通过 `launchctl kickstart -k ...` 清理
+- 因此当前最准确的口径不是“所有后续步骤都已在新模型下完整闭环”，而是：
+  - `plan/setup` 无人值守推进已经重新成立
+  - `implement -> verify` 的 loop handoff 也已经再次成立
+  - `implement/verify/test/pr/review` 在新模型下仍建议继续做一次更长的 unattended soak

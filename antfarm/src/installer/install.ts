@@ -8,6 +8,7 @@ import { updateMainAgentGuidance } from "./main-agent-guidance.js";
 import { addSubagentAllowlist } from "./subagent-allowlist.js";
 import { installAntfarmSkill } from "./skill-install.js";
 import type { AgentRole, WorkflowInstallResult } from "./types.js";
+import { resolveOpenClawStateDir, resolveWorkflowWorkspaceDir } from "./paths.js";
 
 function ensureAgentList(config: { agents?: { list?: Array<Record<string, unknown>>; defaults?: Record<string, unknown> } }) {
   if (!config.agents) config.agents = {};
@@ -154,6 +155,7 @@ export function getMaxRoleTimeoutSeconds(): number {
 }
 
 const SUBAGENT_POLICY = { allowAgents: [] as string[] };
+const CRON_AGENT_SUFFIX = "__cron";
 
 /**
  * Infer an agent's role from its id when not explicitly set in workflow YAML.
@@ -171,20 +173,132 @@ function inferRole(agentId: string): AgentRole {
   return "coding";
 }
 
-function buildToolsConfig(role: AgentRole): Record<string, unknown> {
+export function buildCronAgentId(workflowId: string, agentId: string): string {
+  return `${workflowId}_${agentId}${CRON_AGENT_SUFFIX}`;
+}
+
+function resolveManagedAgentDir(agentId: string): string {
+  const safeId = agentId.replace(/[^a-zA-Z0-9_-]/g, "__");
+  return path.join(resolveOpenClawStateDir(), "agents", safeId, "agent");
+}
+
+function resolveCronWorkspaceDir(workflowId: string, agentId: string): string {
+  return path.join(resolveWorkflowWorkspaceDir(workflowId), "__cron", agentId);
+}
+
+export function buildWorkflowAgentToolsConfig(role: AgentRole): Record<string, unknown> {
   const defaults = ROLE_POLICIES[role];
   const tools: Record<string, unknown> = {};
   if (defaults.profile) tools.profile = defaults.profile;
   if (defaults.alsoAllow?.length) tools.alsoAllow = defaults.alsoAllow;
   tools.deny = defaults.deny;
-  tools.exec = {
-    host: "gateway",
-    security: "full",
-    ask: "off",
-  };
   return tools;
 }
 
+export function buildCronAgentToolsConfig(): Record<string, unknown> {
+  return {
+    profile: "coding",
+    deny: [
+      ...ALWAYS_DENY,
+      "write", "edit", "apply_patch",
+      "image", "tts",
+      "browser", "web_search", "web_fetch",
+      "group:ui",
+    ],
+    exec: {
+      host: "gateway",
+      security: "full",
+      ask: "off",
+    },
+  };
+}
+
+function buildCronSubagentPolicy(agentId: string): { allowAgents: string[] } {
+  return { allowAgents: [agentId] };
+}
+
+type ManagedAgentConfig = {
+  id: string;
+  name?: string;
+  model?: string;
+  timeoutSeconds?: number;
+  workspaceDir: string;
+  agentDir: string;
+  tools: Record<string, unknown>;
+  subagents?: { allowAgents: string[] };
+  sandbox?: { mode: "off" };
+};
+
+function upsertAgent(
+  list: Array<Record<string, unknown>>,
+  agent: ManagedAgentConfig,
+) {
+  const existing = list.find((entry) => entry.id === agent.id);
+  // Never overwrite the user's default (main) agent — it was configured outside antfarm.
+  if (existing?.default === true) return;
+  const payload: Record<string, unknown> = {
+    id: agent.id,
+    name: agent.name ?? agent.id,
+    workspace: agent.workspaceDir,
+    agentDir: agent.agentDir,
+    tools: agent.tools,
+    subagents: agent.subagents ?? SUBAGENT_POLICY,
+    sandbox: agent.sandbox ?? { mode: "off" },
+  };
+  if (agent.model) payload.model = agent.model;
+  // Note: timeoutSeconds is NOT written to the agent config entry because
+  // OpenClaw's agent schema uses .strict() and rejects unknown keys.
+  // Timeouts are applied via cron job payload.timeoutSeconds instead.
+  if (existing) Object.assign(existing, payload);
+  else list.push(payload);
+}
+
+async function ensureCronAgentResources(workflowId: string, agentId: string): Promise<{ workspaceDir: string; agentDir: string }> {
+  const workspaceDir = resolveCronWorkspaceDir(workflowId, agentId);
+  const agentDir = resolveManagedAgentDir(buildCronAgentId(workflowId, agentId));
+  await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.mkdir(agentDir, { recursive: true });
+  return { workspaceDir, agentDir };
+}
+
+export function buildWorkflowAgentConfig(agent: {
+  id: string;
+  name?: string;
+  model?: string;
+  timeoutSeconds?: number;
+  workspaceDir: string;
+  agentDir: string;
+  role: AgentRole;
+}): ManagedAgentConfig {
+  return {
+    ...agent,
+    tools: buildWorkflowAgentToolsConfig(agent.role),
+    sandbox: { mode: "off" },
+  };
+}
+
+export function buildCronAgentConfig(params: {
+  workflowId: string;
+  localId: string;
+  name?: string;
+  model?: string;
+  timeoutSeconds?: number;
+  workspaceDir: string;
+  agentDir: string;
+}): ManagedAgentConfig {
+  const targetAgentId = `${params.workflowId}_${params.localId}`;
+  return {
+    id: buildCronAgentId(params.workflowId, params.localId),
+    name: params.name ? `${params.name} (Cron)` : `${targetAgentId} (Cron)`,
+    model: params.model,
+    timeoutSeconds: params.timeoutSeconds,
+    workspaceDir: params.workspaceDir,
+    agentDir: params.agentDir,
+    tools: buildCronAgentToolsConfig(),
+    subagents: buildCronSubagentPolicy(targetAgentId),
+    sandbox: { mode: "off" },
+  };
+}
 function ensureCronSessionRetention(config: OpenClawConfig): void {
   if (!config.cron) config.cron = {};
   if (config.cron.sessionRetention === undefined) {
@@ -209,29 +323,6 @@ function ensureSessionMaintenance(config: OpenClawConfig): void {
   if (maintenance.rotateBytes === undefined) {
     maintenance.rotateBytes = DEFAULT_SESSION_MAINTENANCE.rotateBytes;
   }
-}
-
-function upsertAgent(
-  list: Array<Record<string, unknown>>,
-  agent: { id: string; name?: string; model?: string; timeoutSeconds?: number; workspaceDir: string; agentDir: string; role: AgentRole },
-) {
-  const existing = list.find((entry) => entry.id === agent.id);
-  // Never overwrite the user's default (main) agent — it was configured outside antfarm.
-  if (existing?.default === true) return;
-  const payload: Record<string, unknown> = {
-    id: agent.id,
-    name: agent.name ?? agent.id,
-    workspace: agent.workspaceDir,
-    agentDir: agent.agentDir,
-    tools: buildToolsConfig(agent.role),
-    subagents: SUBAGENT_POLICY,
-  };
-  if (agent.model) payload.model = agent.model;
-  // Note: timeoutSeconds is NOT written to the agent config entry because
-  // OpenClaw's agent schema uses .strict() and rejects unknown keys.
-  // Timeouts are applied via cron job payload.timeoutSeconds instead.
-  if (existing) Object.assign(existing, payload);
-  else list.push(payload);
 }
 
 async function writeWorkflowMetadata(params: { workflowDir: string; workflowId: string; source: string }) {
@@ -267,7 +358,17 @@ export async function installWorkflow(params: { workflowId: string }): Promise<W
     const prefix = workflow.id + "_";
     const localId = agent.id.startsWith(prefix) ? agent.id.slice(prefix.length) : agent.id;
     const role = roleMap.get(localId) ?? inferRole(localId);
-    upsertAgent(list, { ...agent, role });
+    upsertAgent(list, buildWorkflowAgentConfig({ ...agent, role }));
+
+    const cronResources = await ensureCronAgentResources(workflow.id, localId);
+    upsertAgent(list, buildCronAgentConfig({
+      workflowId: workflow.id,
+      localId,
+      name: agent.name,
+      model: agent.model,
+      timeoutSeconds: agent.timeoutSeconds,
+      ...cronResources,
+    }));
   }
   await writeOpenClawConfig(configPath, config);
   await updateMainAgentGuidance();

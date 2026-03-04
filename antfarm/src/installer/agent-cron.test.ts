@@ -7,7 +7,8 @@ describe("buildWorkPrompt", () => {
     const prompt = buildWorkPrompt("feature-dev", "planner");
     assert.ok(prompt.includes("Reply with:"));
     assert.ok(prompt.includes("NEVER default to STATUS/CHANGES/TESTS"));
-    assert.ok(prompt.includes('explicitly set exec host to "gateway" and exec security to "full"'));
+    assert.ok(prompt.includes("use the current agent's default exec policy"));
+    assert.ok(prompt.includes('Do NOT force exec host to "gateway"'));
     assert.ok(!prompt.includes("CHANGES: what you did"));
     assert.ok(!prompt.includes("TESTS: what tests you ran"));
     assert.ok(prompt.includes("<paste the exact KEY: VALUE output required by the claimed step here>"));
@@ -15,10 +16,10 @@ describe("buildWorkPrompt", () => {
 });
 
 describe("buildPollingPrompt", () => {
-  it("includes a direct-execution fallback when sessions_spawn is unavailable", async () => {
+  it("fails the claimed step instead of executing it in the cron session when sessions_spawn fails", async () => {
     const { buildPollingPrompt } = await import("./agent-cron.js");
     const prompt = buildPollingPrompt("feature-dev", "developer", "openai-relay/gpt-5.1");
-    assert.ok(prompt.includes("If sessions_spawn is unavailable, rejected, or fails for any reason, DO NOT stop."));
-    assert.ok(prompt.includes("continue in the current cron session and execute the claimed step yourself"));
+    assert.ok(prompt.includes('step fail "<stepId>" "Failed to spawn worker session for feature-dev_developer"'));
+    assert.ok(!prompt.includes("execute the claimed step yourself"));
   });
 });

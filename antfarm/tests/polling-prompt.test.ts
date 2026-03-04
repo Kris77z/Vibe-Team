@@ -37,6 +37,7 @@ describe("buildPollingPrompt", () => {
     const prompt = buildPollingPrompt("feature-dev", "developer");
     assert.ok(prompt.includes("sessions_spawn"), "should mention sessions_spawn");
     assert.ok(prompt.includes('"feature-dev_developer"'), "should include full agentId");
+    assert.ok(prompt.includes('runtime: "subagent"'), "should force native subagent runtime");
   });
 
   it("includes the full work prompt with step complete/fail instructions", () => {

@@ -368,12 +368,14 @@ steps:
       - Do a repo-level final review instead of a GitHub PR review
       - Do NOT call gh pr view / gh pr review
       - Base your decision on the branch diff, tests, and progress log
+      - If changes are needed, report them in FEEDBACK in this step output; do NOT try to comment on a PR
 
       Otherwise:
       - Use: gh pr view, gh pr diff to read the PR
       - Post your review to GitHub using:
         - If approving: gh pr review <number> --approve --body "your review summary"
         - If requesting changes: gh pr review <number> --request-changes --body "your feedback"
+      - If changes are needed, add comments to the PR explaining what needs to change
 
       ## Visual Review (Frontend Changes)
       Has frontend changes: {{has_frontend_changes}}
@@ -393,8 +395,6 @@ steps:
       7. Include your visual design assessment in the review output
 
       If {{has_frontend_changes}} is 'false', skip visual review entirely.
-
-      If changes needed, add comments to the PR explaining what needs to change.
 
       Reply with:
       STATUS: done

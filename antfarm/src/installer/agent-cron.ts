@@ -3,6 +3,7 @@ import type { WorkflowSpec } from "./types.js";
 import { resolveAntfarmCliCommand } from "./paths.js";
 import { getDb } from "../db.js";
 import { readOpenClawConfig } from "./openclaw-config.js";
+import { buildCronAgentId } from "./install.js";
 
 const DEFAULT_EVERY_MS = 300_000; // 5 minutes
 const DEFAULT_AGENT_TIMEOUT_SECONDS = 30 * 60; // 30 minutes
@@ -29,7 +30,7 @@ The "input" field contains your FULLY RESOLVED task instructions. Read it carefu
 Step 3 — Do the work described in the input.
 Before reporting completion, find the "Reply with:" section inside the claimed step input and mirror that schema exactly.
 Different steps require different keys. NEVER default to STATUS/CHANGES/TESTS unless the claimed step explicitly requires them.
-When using the exec tool for Antfarm/OpenClaw CLI, git, npm, or other local shell commands in this workflow, explicitly set exec host to "gateway" and exec security to "full". Never request sandbox host or allowlist security for these commands.
+When using the exec tool for Antfarm/OpenClaw CLI, git, npm, or other local shell commands in this workflow, use the current agent's default exec policy. Do NOT force exec host to "gateway" if the agent policy rejects it.
 
 Step 4 — MANDATORY: Report completion (do this IMMEDIATELY after finishing the work):
 \`\`\`
@@ -69,7 +70,7 @@ The "input" field contains your FULLY RESOLVED task instructions. Read it carefu
 Do the work described in the input.
 Before reporting completion, find the "Reply with:" section inside the claimed step input and mirror that schema exactly.
 Different steps require different keys. NEVER default to STATUS/CHANGES/TESTS unless the claimed step explicitly requires them.
-When using the exec tool for Antfarm/OpenClaw CLI, git, npm, or other local shell commands in this workflow, explicitly set exec host to "gateway" and exec security to "full". Never request sandbox host or allowlist security for these commands.
+When using the exec tool for Antfarm/OpenClaw CLI, git, npm, or other local shell commands in this workflow, use the current agent's default exec policy. Do NOT force exec host to "gateway" if the agent policy rejects it.
 
 MANDATORY: Report completion (do this IMMEDIATELY after finishing the work):
 \`\`\`
@@ -152,12 +153,16 @@ If output is "NO_WORK", reply HEARTBEAT_OK and stop.
 If JSON is returned, parse it to extract stepId, runId, and input fields.
 Then call sessions_spawn with these parameters:
 - agentId: "${fullAgentId}"
+- runtime: "subagent"
 - model: "${model}"
 - task: The full work prompt below, followed by "\\n\\nCLAIMED STEP JSON:\\n" and the exact JSON output from step claim.
 
-If sessions_spawn is unavailable, rejected, or fails for any reason, DO NOT stop.
-Instead, continue in the current cron session and execute the claimed step yourself using the exact same work prompt and claimed-step JSON below.
-In that fallback path, you must still call step complete or step fail before ending the session.
+If sessions_spawn is unavailable, rejected, or fails for any reason, do NOT execute the claimed step in this cron session.
+Instead, immediately fail the claimed step so it can retry or escalate cleanly:
+\`\`\`
+${cli} step fail "<stepId>" "Failed to spawn worker session for ${fullAgentId}"
+\`\`\`
+Then stop.
 
 Full work prompt to include in the spawned task:
 ---START WORK PROMPT---
@@ -180,13 +185,14 @@ export async function setupAgentCrons(workflow: WorkflowSpec): Promise<void> {
     const agent = agents[i];
     const anchorMs = i * 60_000; // stagger by 1 minute each
     const cronName = `antfarm/${workflow.id}/${agent.id}`;
-    const agentId = `${workflow.id}_${agent.id}`;
+    const workAgentId = `${workflow.id}_${agent.id}`;
+    const pollerAgentId = buildCronAgentId(workflow.id, agent.id);
 
     // Two-phase: Phase 1 uses cheap polling model + minimal prompt
     const requestedPollingModel = agent.pollingModel ?? workflowPollingModel;
-    const pollingModel = await resolveAgentCronModel(agentId, requestedPollingModel);
+    const pollingModel = await resolveAgentCronModel(pollerAgentId, requestedPollingModel);
     const requestedWorkModel = agent.model ?? workflowPollingModel;
-    const workModel = await resolveAgentCronModel(agentId, requestedWorkModel);
+    const workModel = await resolveAgentCronModel(workAgentId, requestedWorkModel);
     const prompt = buildPollingPrompt(workflow.id, agent.id, workModel);
     const timeoutSeconds = workflowPollingTimeout;
 
@@ -194,7 +200,7 @@ export async function setupAgentCrons(workflow: WorkflowSpec): Promise<void> {
       name: cronName,
       schedule: { kind: "every", everyMs, anchorMs },
       sessionTarget: "isolated",
-      agentId,
+      agentId: pollerAgentId,
       payload: { kind: "agentTurn", message: prompt, model: pollingModel, timeoutSeconds },
       delivery: { mode: "none" },
       enabled: true,

@@ -62,6 +62,11 @@ describe("cron payload includes polling model (regression #121)", () => {
     await setupAgentCrons(fakeWorkflow as any);
 
     assert.equal(capturedJobs.length, 1, "should create one cron job");
+    assert.equal(
+      capturedJobs[0].agentId,
+      "test-workflow_agent-a__cron",
+      "cron job should run under the dedicated poller agent"
+    );
     const payload = capturedJobs[0].payload;
 
     // Key regression assertion: payload.model must be the polling model, NOT opus
@@ -117,6 +122,8 @@ describe("cron payload includes polling model (regression #121)", () => {
     await setupAgentCrons(fakeWorkflow as any);
 
     assert.equal(capturedJobs.length, 2, "should create two cron jobs");
+    assert.equal(capturedJobs[0].agentId, "test-override_cheap-agent__cron");
+    assert.equal(capturedJobs[1].agentId, "test-override_default-agent__cron");
 
     // Agent with pollingModel override
     assert.equal(
@@ -158,6 +165,7 @@ describe("cron payload includes polling model (regression #121)", () => {
 
     await setupAgentCrons(fakeWorkflow as any);
 
+    assert.equal(capturedJobs[0].agentId, "test-timeout_agent-t__cron");
     assert.equal(capturedJobs[0].payload.timeoutSeconds, 120,
       "cron payload should include timeoutSeconds from workflow polling config");
   });
