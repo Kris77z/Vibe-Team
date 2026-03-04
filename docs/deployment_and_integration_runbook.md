@@ -1,5 +1,8 @@
 # Vibe-Team 部署与联调手册
 
+> 文档拆分说明：主入口见 [docs/agent_team/README.md](/Users/applychart/Desktop/vibe-team/docs/agent_team/README.md)。  
+> 本文聚焦“部署、联调、运行排障”；推进过程与关键节点请写入 [docs/agent_team/progress.md](/Users/applychart/Desktop/vibe-team/docs/agent_team/progress.md)。
+
 ## 1. 适用范围
 
 这份文档用于在另一台 Mac 上部署并联调当前方案中的三套系统：
@@ -2068,7 +2071,43 @@ tail -n 120 "$INSTANCE_ROOT/state/logs/gateway.err.log"
 
 满足以下条件即可进入下一阶段（输出契约收敛）：
 
-1. 至少 1 次 run 在新权限分离模型下稳定跑到 terminal
+1. 至少连续 3 次 unattended run 在新权限分离模型下跑到 terminal
 2. terminal 结果可被 Spacebot 面板稳定展示
 3. 无需人工 `step claim`
-4. 人工恢复动作不再是常态（最多偶发）
+4. 不依赖 `launchctl kickstart` 才能持续推进（允许偶发恢复，但不应成为每轮必需动作）
+5. 不再出现长期 `runningAtMs` 残留导致的步骤停滞
+
+---
+
+## 25. 当前目标与下一步工作
+
+### 25.1 当前目标（2026-03）
+
+当前目标已经从“能不能跑通”切换为：
+
+1. 提升 unattended 运行稳定性和可重复性
+2. 降低人工恢复依赖（尤其是 `kickstart`）
+3. 为下一阶段“结果输出契约收敛”建立稳定运行基线
+
+换句话说，当前不是继续扩功能，而是先把现有链路做稳。
+
+### 25.2 下一步工作顺序
+
+1. 继续跑 1-2 轮 unattended soak，重点观察 `implement -> verify -> test -> pr -> review -> terminal`
+2. 每轮仅记录统一 6 字段（见 24.3），避免日志噪音淹没有效信号
+3. 如再次卡住，优先归类为：
+   - 运行时稳定性（cron/gateway/recovery）
+   - workflow 输出契约问题（step 输出与 `Reply with` 不一致）
+   - 目标 repo 任务适配问题（命令、分支、环境差异）
+4. 当满足 24.5 标准后，再进入“输出契约收敛”阶段：
+   - 固定 reviewer/tester 的 terminal 输出字段
+   - 减少 Spacebot 侧 best-effort 解析
+
+### 25.3 当前阶段明确不优先做的事项
+
+1. 继续改 Spacebot UI
+2. 做 Dashboard 嵌入
+3. 做自然语言自动触发 workflow
+4. 立即切换到 `feature-dev-split` 作为主流程
+
+以上事项可在稳定性基线达标后再推进。

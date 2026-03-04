@@ -1,5 +1,8 @@
 # Vibe-Team 敏捷智能体团队架构方案 (Agile Agent Team)
 
+> 文档拆分说明：主入口见 [docs/agent_team/README.md](/Users/applychart/Desktop/vibe-team/docs/agent_team/README.md)。  
+> 本文主要保留“架构原则与设计基线”，推进记录请写入 [docs/agent_team/progress.md](/Users/applychart/Desktop/vibe-team/docs/agent_team/progress.md)。
+
 ## 1. 架构愿景与设计理念
 
 本方案目标是搭建一个由 AI Agent 协作完成需求分析、开发、验证、测试与交付的「虚拟敏捷团队」。
@@ -240,6 +243,24 @@ vibe-team/
 2. 在目标 Mac 上完成真实安装和运行。
 3. 验证 `Spacebot -> Antfarm -> OpenClaw` 全链路。
 4. 可选保留 `Antfarm Dashboard` 作为调试入口，但不再把它定义为主流程必经环节。
+
+### 当前阶段目标（2026-03）
+
+结合最新实机联调结果，当前阶段目标已从“主链是否可跑”切换为“主链是否可稳定重复运行”。
+
+当前优先级：
+
+1. 保持 `feature-dev` 在权限分离模型下的 unattended 可重复推进
+2. 降低对人工恢复动作（如 `kickstart`）的依赖
+3. 在稳定性达标后再推进输出契约收敛和分工版 workflow
+
+当前不优先事项：
+
+1. 继续扩 UI 功能
+2. Dashboard 嵌入
+3. 过早切换到复杂并行分工流程
+
+执行细节以 `docs/deployment_and_integration_runbook.md` 的最新章节为准。
 
 ---
 
