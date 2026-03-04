@@ -42,6 +42,20 @@
 2. 降低 `runningAtMs` 残留导致的卡顿概率
 3. 收敛 terminal 结构化输出，减少 best-effort 解析
 
+### 2026-03-04（输出契约收敛启动）
+
+已完成（代码侧）：
+
+1. `feature-dev` 的 `review` 步骤输出新增 `FINAL_RESULT_JSON`（单行 JSON）
+2. `Spacebot` 终态结果解析改为：优先读 `FINAL_RESULT_JSON`，缺失时回退旧键值输出（`CHANGES/TESTS/DECISION/BRANCH/PR`）
+3. `PR: skipped ...` 不再被误识别为 `pr_url`
+
+待验证（部署机）：
+
+1. 重新安装 workflow 后发起一轮 unattended run
+2. 在 Spacebot UI 确认 terminal 字段稳定展示
+3. 验证旧 run（无 JSON 契约）仍可回显结果
+
 ## 4. 下一步决策
 
 当前优先级：

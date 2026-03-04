@@ -2134,3 +2134,30 @@ tail -n 120 "$INSTANCE_ROOT/state/logs/gateway.err.log"
 4. 立即切换到 `feature-dev-split` 作为主流程
 
 以上事项可在稳定性基线达标后再推进。
+
+### 25.4 terminal 输出契约 v1（当前建议）
+
+为降低 Spacebot 端 best-effort 解析误差，`feature-dev` 的 `review` 终态输出建议固定为：
+
+```text
+STATUS: done
+DECISION: approved
+CHANGES: ...
+TESTS: ...
+BRANCH: ...
+PR: ...
+OPEN_QUESTIONS: none
+FINAL_RESULT_JSON: {"changes":"...","tests":"...","review_decision":"approved","branch":"...","pr_url":"...","needs_human_acceptance":true,"open_questions":[]}
+```
+
+解析规则（Spacebot 当前实现）：
+
+1. 优先读取 `FINAL_RESULT_JSON`
+2. 若 JSON 缺失或非法，回退读取旧键值字段：`CHANGES/TESTS/DECISION/BRANCH/PR`
+3. `PR` 只有 `http/https` 才会被识别为 `pr_url`；`PR: skipped ...` 会被视为无 PR
+4. `review_decision` 归一化到：`approved | changes_requested | not_approved`
+
+联调验收建议：
+
+1. 先验证新 run 的 JSON 契约路径
+2. 再抽查旧 run 的回退兼容路径

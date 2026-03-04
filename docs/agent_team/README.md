@@ -29,13 +29,13 @@
 后续请按分文档维护，不再把所有内容堆进单一 runbook。
 
 1. 架构与原则
-   - [agile_agent_team_architecture.md](/Users/kris/Desktop/Dev/Vibe-Team/docs/agile_agent_team_architecture.md)
+   - [agile_agent_team_architecture.md](../agile_agent_team_architecture.md)
 2. 部署、联调、运行排障
-   - [deployment_and_integration_runbook.md](/Users/kris/Desktop/Dev/Vibe-Team/docs/deployment_and_integration_runbook.md)
+   - [deployment_and_integration_runbook.md](../deployment_and_integration_runbook.md)
 3. 推进过程与关键节点（阶段记录）
-   - [progress.md](/Users/kris/Desktop/Dev/Vibe-Team/docs/agent_team/progress.md)
+   - [progress.md](./progress.md)
 4. 当前多仓闭环流程（4 库 + 测试）
-   - [workflow_web_4repos.md](/Users/kris/Desktop/Dev/Vibe-Team/docs/agent_team/workflow_web_4repos.md)
+   - [workflow_web_4repos.md](./workflow_web_4repos.md)
 
 ## 4. 当前执行顺序
 

@@ -245,6 +245,89 @@ fn extract_output_value(output: Option<&str>, key: &str) -> String {
         .to_string()
 }
 
+fn extract_output_json_object(output: Option<&str>, key: &str) -> Option<serde_json::Value> {
+    let raw = extract_output_value(output, key);
+    if raw.is_empty() {
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value.is_object().then_some(value)
+}
+
+fn extract_json_string(value: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    value
+        .and_then(|json| json.get(key))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_json_bool(value: Option<&serde_json::Value>, key: &str) -> Option<bool> {
+    value
+        .and_then(|json| json.get(key))
+        .and_then(serde_json::Value::as_bool)
+}
+
+fn extract_json_string_array(value: Option<&serde_json::Value>, key: &str) -> Option<Vec<String>> {
+    let list = value
+        .and_then(|json| json.get(key))
+        .and_then(serde_json::Value::as_array)?;
+
+    Some(
+        list.iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
+}
+
+fn extract_open_questions(output: Option<&str>) -> Vec<String> {
+    let raw = extract_output_value(output, "OPEN_QUESTIONS");
+    if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+
+    raw.split(';')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_review_decision(raw_decision: &str, run_status: &str) -> String {
+    let normalized = raw_decision.trim().to_lowercase();
+    let mapped = match normalized.as_str() {
+        "approved" => Some("approved".to_string()),
+        "changes requested" | "changes_requested" | "request_changes" | "requested_changes" => {
+            Some("changes_requested".to_string())
+        }
+        "not approved" | "not_approved" => Some("not_approved".to_string()),
+        "" => None,
+        other => Some(other.replace(' ', "_")),
+    };
+
+    mapped.unwrap_or_else(|| {
+        if run_status == "completed" {
+            "approved".to_string()
+        } else {
+            "not_approved".to_string()
+        }
+    })
+}
+
+fn normalize_pr_url(raw: String) -> Option<String> {
+    let raw = raw.trim();
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        Some(raw.to_string())
+    } else {
+        None
+    }
+}
+
 fn map_run_to_summary(
     run: AntfarmRunDetail,
     stories: Vec<AntfarmStory>,
@@ -280,6 +363,52 @@ fn map_run_to_final_result(
 
     let last_done_step = run.steps.iter().rev().find(|step| step.status == "done");
     let output = last_done_step.and_then(|step| step.output.as_deref());
+    let final_contract = extract_output_json_object(output, "FINAL_RESULT_JSON");
+    let final_contract_ref = final_contract.as_ref();
+
+    let changes = extract_json_string(final_contract_ref, "changes").unwrap_or_else(|| {
+        let changes = extract_output_value(output, "CHANGES");
+        if changes.is_empty() {
+            extract_output_value(output, "RESULTS")
+        } else {
+            changes
+        }
+    });
+    let tests = extract_json_string(final_contract_ref, "tests").unwrap_or_else(|| {
+        let tests = extract_output_value(output, "TESTS");
+        if tests.is_empty() {
+            extract_output_value(output, "RESULTS")
+        } else {
+            tests
+        }
+    });
+    let review_decision = normalize_review_decision(
+        &extract_json_string(final_contract_ref, "review_decision")
+            .unwrap_or_else(|| extract_output_value(output, "DECISION")),
+        &run.status,
+    );
+    let branch = extract_json_string(final_contract_ref, "branch").or_else(|| {
+        let branch = extract_output_value(output, "BRANCH");
+        if branch.is_empty() {
+            None
+        } else {
+            Some(branch)
+        }
+    });
+    let pr_url = extract_json_string(final_contract_ref, "pr_url")
+        .and_then(normalize_pr_url)
+        .or_else(|| {
+            let pr = extract_output_value(output, "PR");
+            if pr.is_empty() {
+                None
+            } else {
+                normalize_pr_url(pr)
+            }
+        });
+    let needs_human_acceptance = extract_json_bool(final_contract_ref, "needs_human_acceptance")
+        .unwrap_or(run.status == "completed");
+    let open_questions = extract_json_string_array(final_contract_ref, "open_questions")
+        .unwrap_or_else(|| extract_open_questions(output));
 
     Some(FinalRunResult {
         run_id: run.id,
@@ -287,55 +416,18 @@ fn map_run_to_final_result(
         status: run.status.clone(),
         summary: FinalRunSummary {
             task: run.task,
-            // Best-effort extraction for the draft.
-            // Production integration should formalize final-step output keys.
-            changes: {
-                let changes = extract_output_value(output, "CHANGES");
-                if changes.is_empty() {
-                    extract_output_value(output, "RESULTS")
-                } else {
-                    changes
-                }
-            },
-            tests: {
-                let tests = extract_output_value(output, "TESTS");
-                if tests.is_empty() {
-                    extract_output_value(output, "RESULTS")
-                } else {
-                    tests
-                }
-            },
-            review_decision: {
-                let decision = extract_output_value(output, "DECISION");
-                if decision.is_empty() {
-                    if run.status == "completed" {
-                        "approved".to_string()
-                    } else {
-                        "not_approved".to_string()
-                    }
-                } else {
-                    decision
-                }
-            },
+            changes,
+            tests,
+            review_decision,
         },
         artifacts: FinalRunArtifacts {
-            branch: {
-                let branch = extract_output_value(output, "BRANCH");
-                if branch.is_empty() {
-                    None
-                } else {
-                    Some(branch)
-                }
-            },
-            pr_url: {
-                let pr = extract_output_value(output, "PR");
-                if pr.is_empty() { None } else { Some(pr) }
-            },
+            branch,
+            pr_url,
             commit_range: None,
         },
         handoff: FinalRunHandoff {
-            needs_human_acceptance: run.status == "completed",
-            open_questions: Vec::new(),
+            needs_human_acceptance,
+            open_questions,
         },
     })
 }
@@ -755,5 +847,85 @@ impl AntfarmService for MockAntfarmService {
                 open_questions: Vec::new(),
             },
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_terminal_run(status: &str, output: &str) -> AntfarmRunDetail {
+        AntfarmRunDetail {
+            id: "run-123".to_string(),
+            workflow_id: "feature-dev".to_string(),
+            task: "Implement feature".to_string(),
+            status: status.to_string(),
+            updated_at: "2026-03-04T00:00:00Z".to_string(),
+            steps: vec![AntfarmRunStep {
+                step_id: "review".to_string(),
+                agent_id: "reviewer".to_string(),
+                status: "done".to_string(),
+                output: Some(output.to_string()),
+            }],
+        }
+    }
+
+    #[test]
+    fn final_result_prefers_structured_json_contract() {
+        let output = r#"STATUS: done
+DECISION: approved
+FINAL_RESULT_JSON: {"changes":"api + frontend integrated","tests":"npm test (42 passed)","review_decision":"approved","branch":"feature/x","pr_url":"https://example.invalid/pr/42","needs_human_acceptance":false,"open_questions":["confirm rollout window"]}"#;
+
+        let run = make_terminal_run("completed", output);
+        let result = map_run_to_final_result(run, vec![]).expect("terminal result expected");
+
+        assert_eq!(result.summary.changes, "api + frontend integrated");
+        assert_eq!(result.summary.tests, "npm test (42 passed)");
+        assert_eq!(result.summary.review_decision, "approved");
+        assert_eq!(result.artifacts.branch.as_deref(), Some("feature/x"));
+        assert_eq!(
+            result.artifacts.pr_url.as_deref(),
+            Some("https://example.invalid/pr/42")
+        );
+        assert!(!result.handoff.needs_human_acceptance);
+        assert_eq!(
+            result.handoff.open_questions,
+            vec!["confirm rollout window".to_string()]
+        );
+    }
+
+    #[test]
+    fn final_result_falls_back_to_legacy_key_value_fields() {
+        let output = r#"STATUS: done
+CHANGES: add api endpoint and ui rendering
+TESTS: npm test && npm run e2e
+DECISION: changes_requested
+BRANCH: feature/y
+PR: skipped (task explicitly does not require a real PR)
+OPEN_QUESTIONS: none"#;
+
+        let run = make_terminal_run("completed", output);
+        let result = map_run_to_final_result(run, vec![]).expect("terminal result expected");
+
+        assert_eq!(result.summary.changes, "add api endpoint and ui rendering");
+        assert_eq!(result.summary.tests, "npm test && npm run e2e");
+        assert_eq!(result.summary.review_decision, "changes_requested");
+        assert_eq!(result.artifacts.branch.as_deref(), Some("feature/y"));
+        assert_eq!(result.artifacts.pr_url, None);
+        assert!(result.handoff.needs_human_acceptance);
+        assert!(result.handoff.open_questions.is_empty());
+    }
+
+    #[test]
+    fn final_result_defaults_to_not_approved_for_failed_runs_without_decision() {
+        let output = r#"STATUS: done
+CHANGES: partial attempt
+TESTS: failing in integration"#;
+
+        let run = make_terminal_run("failed", output);
+        let result = map_run_to_final_result(run, vec![]).expect("terminal result expected");
+
+        assert_eq!(result.summary.review_decision, "not_approved");
+        assert!(!result.handoff.needs_human_acceptance);
     }
 }

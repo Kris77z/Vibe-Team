@@ -2,7 +2,7 @@
 # session with clean context. Memory persists via git history and progress files.
 id: feature-dev
 name: Feature Development Workflow
-version: 5
+version: 6
 description: |
   Story-based execution pipeline. Planner decomposes tasks into user stories.
   Setup prepares the environment and establishes baseline.
@@ -354,6 +354,8 @@ steps:
       PR_MODE: {{pr_mode}}
       TASK: {{task}}
       CHANGES: {{changes}}
+      RESULTS: {{results}}
+      BRANCH: {{branch}}
 
       PROGRESS LOG:
       {{progress}}
@@ -399,6 +401,18 @@ steps:
       Reply with:
       STATUS: done
       DECISION: approved
+      CHANGES: concise summary of delivered changes
+      TESTS: concise summary of test/integration outcomes
+      BRANCH: {{branch}}
+      PR: {{pr}}
+      OPEN_QUESTIONS: none
+      FINAL_RESULT_JSON: {"changes":"...","tests":"...","review_decision":"approved","branch":"{{branch}}","pr_url":"{{pr}}","needs_human_acceptance":true,"open_questions":[]}
+
+      Notes for FINAL_RESULT_JSON:
+      - Output exactly one-line valid JSON object (no markdown code fence)
+      - review_decision must be one of: approved | changes_requested | not_approved
+      - If PR_MODE is skip, set pr_url to null and still include branch
+      - If there are unresolved blockers, list them in open_questions (array of strings)
 
       Or if changes needed:
       STATUS: retry

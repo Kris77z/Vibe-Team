@@ -42,6 +42,12 @@ If approved:
 ```
 STATUS: done
 DECISION: approved
+CHANGES: concise summary
+TESTS: concise summary
+BRANCH: <branch name>
+PR: <pr url or skipped text>
+OPEN_QUESTIONS: none
+FINAL_RESULT_JSON: {"changes":"...","tests":"...","review_decision":"approved","branch":"...","pr_url":"...","needs_human_acceptance":true,"open_questions":[]}
 ```
 
 If changes needed:
@@ -52,6 +58,12 @@ FEEDBACK:
 - Specific change needed 1
 - Specific change needed 2
 ```
+
+When emitting `FINAL_RESULT_JSON`:
+- Keep it on one line and valid JSON (no markdown fence).
+- `review_decision` must be one of `approved`, `changes_requested`, `not_approved`.
+- If PR is skipped/unavailable, set `pr_url` to `null`.
+- Use `open_questions` as an array of unresolved blockers; otherwise `[]`.
 
 ## Standards
 
