@@ -1903,3 +1903,120 @@ live 结果显示：
   - `plan/setup` 无人值守推进已经重新成立
   - `implement -> verify` 的 loop handoff 也已经再次成立
   - `implement/verify/test/pr/review` 在新模型下仍建议继续做一次更长的 unattended soak
+
+---
+
+## 24. 当前部署机推进清单（可直接给部署机 LLM）
+
+本节只回答“现在下一步怎么做”，不再展开历史背景。
+
+### 24.1 当前阶段目标
+
+当前目标不是继续改 UI，也不是继续扩架构，而是验证：
+
+- `feature-dev` 在“权限分离 + __cron helper”模型下
+- 能否在**无人手工 claim**的情况下稳定跑到 terminal
+
+也就是继续做一轮更长的 unattended soak，重点覆盖：
+
+1. `implement`
+2. `verify`
+3. `test`
+4. `pr`
+5. `review`
+6. terminal (`completed` / `failed`)
+
+### 24.2 部署机最小执行步骤
+
+在部署机执行：
+
+```bash
+export INSTANCE_ROOT="/Users/kris/instances/vibe-team"
+export OPENCLAW_STATE_DIR="$INSTANCE_ROOT/state"
+export OPENCLAW_CONFIG_PATH="$INSTANCE_ROOT/config/openclaw.json"
+export ANT="$INSTANCE_ROOT/bin/antfarm-vibe-team"
+```
+
+先做健康检查：
+
+```bash
+curl -sf http://127.0.0.1:18889/v1/models >/dev/null && echo "openclaw ok"
+curl -sf http://127.0.0.1:3333/api/workflows >/dev/null && echo "antfarm dashboard ok"
+curl -sf http://127.0.0.1:19898/api/health >/dev/null && echo "spacebot ok"
+```
+
+确认 `feature-dev` 的 `__cron` jobs 已存在：
+
+```bash
+jq -r '.[].agentId // empty' "$OPENCLAW_STATE_DIR/cron/jobs.json" | rg '^feature-dev_.*__cron$' | sort -u
+```
+
+如需重建（例如刚更新过 installer/workflow）：
+
+```bash
+"$ANT" workflow crons-recreate feature-dev
+```
+
+然后发起新的 unattended run（推荐仍从 Spacebot UI 发起）。  
+如需 API 触发，可参考：
+
+```bash
+curl -X POST http://127.0.0.1:19898/api/antfarm/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_id": "soak-feature-dev-001",
+    "conversation_id": "portal:chat:pm",
+    "workflow_id": "feature-dev",
+    "task_title": "做一次更长的 unattended soak",
+    "task_body": "验证 feature-dev 在权限分离 + __cron helper 模型下能否无人手工 claim 跑到 terminal。REPO_PATH: /ABS/PATH/TO/TARGET REPO: /ABS/PATH/TO/TARGET BRANCH: chore/feature-dev-soak-001",
+    "repo_path": "/ABS/PATH/TO/TARGET",
+    "branch": "chore/feature-dev-soak-001",
+    "metadata": {}
+  }'
+```
+
+### 24.3 运行中只关注这几项
+
+每轮 soak 只记录这 6 个字段：
+
+1. `run_id`
+2. `last_progress_event`
+3. `current_step`
+4. `current_agent`
+5. `terminal_status` (`completed` / `failed` / `stuck`)
+6. `manual_recovery_action`（如有）
+
+如果卡住，再补这两类日志：
+
+```bash
+tail -n 120 "$INSTANCE_ROOT/state/antfarm/launchd-dashboard.stderr.log"
+tail -n 120 "$INSTANCE_ROOT/state/logs/gateway.err.log"
+```
+
+### 24.4 可直接给部署机 LLM 的任务模板
+
+把下面这段直接给部署机 LLM：
+
+```text
+目标：在当前实例上执行一次更长的 feature-dev unattended soak，并给出结构化结果。
+
+要求：
+1. 不做新的架构改造，不改 Spacebot UI。
+2. 先做服务健康检查（openclaw/antfarm/spacebot）。
+3. 确认 feature-dev 的 __cron jobs 存在；缺失则重建。
+4. 发起一轮新的 feature-dev run（可用 Spacebot UI 或 API）。
+5. 全程不做手工 step claim。
+6. 若卡住，仅允许最小恢复动作（例如 launchctl kickstart），并记录动作与时间。
+7. 输出必须是这 6 个字段：
+   run_id, last_progress_event, current_step, current_agent, terminal_status, manual_recovery_action
+8. 附上关键错误日志片段（若失败或卡住）。
+```
+
+### 24.5 当前阶段完成标准
+
+满足以下条件即可进入下一阶段（输出契约收敛）：
+
+1. 至少 1 次 run 在新权限分离模型下稳定跑到 terminal
+2. terminal 结果可被 Spacebot 面板稳定展示
+3. 无需人工 `step claim`
+4. 人工恢复动作不再是常态（最多偶发）
