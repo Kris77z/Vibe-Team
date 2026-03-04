@@ -2,7 +2,7 @@ import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { getDb } from "../db.js";
-import { claimStep, completeStep, peekStep } from "./step-ops.js";
+import { claimStep, completeStep, peekStep, resetCleanupThrottleForTests } from "./step-ops.js";
 import { assertOutputMatchesReplyContract, extractReplyContracts } from "./step-ops.js";
 
 describe("extractReplyContracts", () => {
@@ -127,6 +127,38 @@ describe("verify_each claiming", () => {
     const claimed = claimStep("feature-dev_verifier");
     assert.equal(claimed.found, true);
     assert.equal(claimed.runId, runId);
+  });
+});
+
+describe("peekStep abandoned cleanup", () => {
+  const runIds: string[] = [];
+
+  afterEach(() => {
+    for (const runId of runIds) cleanupRun(runId);
+    runIds.length = 0;
+    resetCleanupThrottleForTests();
+  });
+
+  it("runs abandoned-step cleanup during polling even when no claim occurs", () => {
+    const runId = crypto.randomUUID();
+    runIds.push(runId);
+    const db = getDb();
+    const stale = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, ?, ?, 'running', '{}', ?, ?)"
+    ).run(runId, "feature-dev", "stale cleanup test", stale, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, abandoned_count, created_at, updated_at) VALUES (?, ?, 'verify', 'feature-dev_verifier', 0, '', 'STATUS: done', 'running', 0, ?, ?)"
+    ).run("stale-step", runId, stale, stale);
+
+    resetCleanupThrottleForTests();
+    assert.equal(peekStep("feature-dev_planner"), "NO_WORK");
+
+    const step = db.prepare("SELECT status, abandoned_count FROM steps WHERE id = ?").get("stale-step") as { status: string; abandoned_count: number };
+    assert.equal(step.status, "pending");
+    assert.equal(step.abandoned_count, 1);
   });
 });
 

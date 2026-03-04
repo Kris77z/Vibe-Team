@@ -1884,25 +1884,76 @@ live 结果显示：
 - `08:40 AM [6dfeca7d] verifier Claimed step`
 - `08:41 AM [6dfeca7d] Story verified`
 
+在同一轮（2026-03-04）继续无人值守运行后，`#17` 最终到达 terminal：
+
+- `09:11 AM [6dfeca7d] tester Claimed step`
+- `09:12 AM [6dfeca7d] Step completed`
+- `09:15 AM [6dfeca7d] developer Claimed step`
+- `09:15 AM [6dfeca7d] Step completed`
+- `09:17 AM [6dfeca7d] reviewer Claimed step`
+- `09:17 AM [6dfeca7d] Step completed`
+- `09:17 AM [6dfeca7d] Run completed`
+
 因此可以把当前 live 结论更新为：
 
 - `feature-dev` 在“cron helper 与真实 workflow role 分离”的前提下，已经再次实机证明可在**无人手工 claim**下自动推进
 - 当前至少已连续自动跨过：
   - `plan -> setup`
   - `implement(US-001) -> verify(US-001)`
+- 同一 run 已继续自动完成：
+  - `test -> pr -> review -> terminal(completed)`
 - 这说明权限分离后的核心推进链仍然成立，而不是只在旧的“所有角色都拿 gateway/full exec”模型下才成立
 
 但也要明确保留当前剩余风险：
 
-- 这轮 `#17` 目前仍未在新的权限分离模型下再次完整跑到 terminal
 - live gateway 在重建 cron job 时出现过一次瞬时超时：
   - `gateway timeout after 120ms`
   - 通过 `launchctl kickstart -k gui/$(id -u)/ai.openclaw.vibe-team` 后恢复
 - live cron runtime 也出现过一次 `runningAtMs` 残留，需要同样通过 `launchctl kickstart -k ...` 清理
-- 因此当前最准确的口径不是“所有后续步骤都已在新模型下完整闭环”，而是：
-  - `plan/setup` 无人值守推进已经重新成立
-  - `implement -> verify` 的 loop handoff 也已经再次成立
-  - `implement/verify/test/pr/review` 在新模型下仍建议继续做一次更长的 unattended soak
+- 因此当前最准确的口径是：
+  - `feature-dev` 已在“权限分离 + __cron helper”模型下出现至少 1 次无人手工 claim 的完整 terminal 闭环
+  - 但稳定性仍需继续 soak（目标从“能否到 terminal”切换为“到 terminal 的可重复性与无需重启恢复”）
+
+#### 23.9.8 第二轮 unattended soak（`#18 / f0f5dbed`）结论：已再次到 terminal，但暴露出“polling-only 场景下 abandoned cleanup 触发点不足”的运行面缺口
+
+在 `2026-03-04` 发起第二轮 unattended soak：
+
+- run: `#18 / f0f5dbed-a7bf-4bb4-9a82-9c2a5dcd8a11`
+- 任务目标：在不人工 claim 的前提下验证权限分离模型可重复到 terminal
+
+实机过程里出现过一段长时间停滞：
+
+- `11:56 AM` verifier claimed 后，subagent 输出了 `STATUS: retry ...` 文本，但没有实际执行 `step complete` / `step fail`
+- run 一度停在：
+  - `implement = running`
+  - `verify = running`
+
+随后系统在 `12:40 PM` 自动记录：
+
+- `Step timed out (Reset to pending (abandon 1/5))`
+
+并继续自动推进，最终在 `2026-03-04 01:43 PM` 到达：
+
+- `Run completed`
+
+也就是第二轮 unattended soak 仍然实现了无人手工 claim 的 terminal 闭环。
+
+但本轮也明确暴露了一个实现缺口：
+
+- 现有 `cleanupAbandonedSteps()` 主要由 `claimStep()` 路径触发
+- 当 cron 长时间只做 `peek -> NO_WORK` 轮询时，abandoned 清理触发不够及时/不够稳定
+
+针对这个缺口，已补最小修复（代码已落地并同步 live）：
+
+- `peekStep()` 也纳入同一节流 cleanup 路径（与 `claimStep()` 共用）
+- 增加回归测试覆盖：
+  - polling-only 情况下也能回收超时 `running` step
+
+因此，`#18` 的结论可归纳为：
+
+- ✅ 在权限分离模型下再次完成无人手工 claim 的 terminal run
+- ⚠️ 过程中出现过一次 `step timeout`，说明 worker 不回报时仍会拉长总时长
+- ✅ 针对“peek-only 场景 cleanup 触发不足”的运行面缺口已经补上最小修复
 
 ---
 
@@ -1912,12 +1963,12 @@ live 结果显示：
 
 ### 24.1 当前阶段目标
 
-当前目标不是继续改 UI，也不是继续扩架构，而是验证：
+当前目标不是继续改 UI，也不是继续扩架构，而是继续验证稳定性：
 
 - `feature-dev` 在“权限分离 + __cron helper”模型下
-- 能否在**无人手工 claim**的情况下稳定跑到 terminal
+- 能否在**无人手工 claim**且**不依赖人工重启恢复**的情况下稳定重复跑到 terminal
 
-也就是继续做一轮更长的 unattended soak，重点覆盖：
+第一条 terminal 目标已在 `#17` 达成。下一步建议继续做 1-2 轮 unattended soak，重点观察：
 
 1. `implement`
 2. `verify`
@@ -1925,6 +1976,7 @@ live 结果显示：
 4. `pr`
 5. `review`
 6. terminal (`completed` / `failed`)
+7. 是否出现 `runningAtMs` 残留或需要 `kickstart` 才能恢复
 
 ### 24.2 部署机最小执行步骤
 

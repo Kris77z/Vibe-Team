@@ -590,6 +590,26 @@ function runHasStories(runId: string): boolean {
   return (total?.cnt ?? 0) > 0;
 }
 
+/**
+ * Throttle cleanupAbandonedSteps: run at most once every 5 minutes.
+ * This is used by both peek and claim paths so polling-only cycles can still
+ * recover abandoned running steps.
+ */
+let lastCleanupTime = 0;
+const CLEANUP_THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
+
+function maybeCleanupAbandonedSteps(): void {
+  const now = Date.now();
+  if (now - lastCleanupTime < CLEANUP_THROTTLE_MS) return;
+  cleanupAbandonedSteps();
+  lastCleanupTime = now;
+}
+
+// Exported for deterministic unit tests.
+export function resetCleanupThrottleForTests(): void {
+  lastCleanupTime = 0;
+}
+
 // ── Peek (lightweight work check) ───────────────────────────────────
 
 export type PeekResult = "HAS_WORK" | "NO_WORK";
@@ -641,6 +661,7 @@ function canClaimPendingStep(step: { run_id: string; step_id: string; step_index
  * Returns "HAS_WORK" if any pending/waiting steps exist, "NO_WORK" otherwise.
  */
 export function peekStep(agentId: string): PeekResult {
+  maybeCleanupAbandonedSteps();
   const db = getDb();
   const rows = db.prepare(
     `SELECT s.step_id, s.run_id, s.step_index
@@ -664,21 +685,10 @@ interface ClaimResult {
 }
 
 /**
- * Throttle cleanupAbandonedSteps: run at most once every 5 minutes.
- */
-let lastCleanupTime = 0;
-const CLEANUP_THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
-
-/**
  * Find and claim a pending step for an agent, returning the resolved input.
  */
 export function claimStep(agentId: string): ClaimResult {
-  // Throttle cleanup: run at most once every 5 minutes across all agents
-  const now = Date.now();
-  if (now - lastCleanupTime >= CLEANUP_THROTTLE_MS) {
-    cleanupAbandonedSteps();
-    lastCleanupTime = now;
-  }
+  maybeCleanupAbandonedSteps();
   const db = getDb();
 
   const candidates = db.prepare(
