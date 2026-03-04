@@ -1958,6 +1958,27 @@ live 结果显示：
 - ⚠️ 过程中出现过一次 `step timeout`，说明 worker 不回报时仍会拉长总时长
 - ✅ 针对“peek-only 场景 cleanup 触发不足”的运行面缺口已经补上最小修复
 
+#### 23.9.9 第三轮 unattended soak（`#19 / 1956b73e`）结论：稳定性门槛已达成（连续 3 次 terminal）
+
+在 `2026-03-04` 发起第三轮 unattended soak：
+
+- run: `#19 / 1956b73e-641c-4c60-a351-7128f6022836`
+- 任务目标：验证在 `peek` 路径 cleanup 修复后，链路能否再次无人手工 claim 到 terminal
+
+本轮实机结果：
+
+- `plan -> setup -> implement -> verify -> test -> pr -> review` 全部自动推进并完成
+- 最终状态：`Run completed`
+- 全程未执行人工 `step claim`
+
+结合前两轮：
+
+- `#17`（completed）
+- `#18`（completed，含一次 `step timeout` 后自动恢复）
+- `#19`（completed）
+
+当前已满足本阶段“连续 3 次 unattended terminal”的稳定性门槛，可以从“继续验证能否到 terminal”切换到“输出契约收敛”阶段。
+
 ---
 
 ## 24. 当前部署机推进清单（可直接给部署机 LLM）
@@ -1966,20 +1987,16 @@ live 结果显示：
 
 ### 24.1 当前阶段目标
 
-当前目标不是继续改 UI，也不是继续扩架构，而是继续验证稳定性：
+当前目标不是继续改 UI，也不是继续扩架构，而是进入“输出契约收敛”：
 
 - `feature-dev` 在“权限分离 + __cron helper”模型下
-- 能否在**无人手工 claim**且**不依赖人工重启恢复**的情况下稳定重复跑到 terminal
+- 已经验证可连续 unattended 到 terminal（`#17/#18/#19`）
 
-第一条 terminal 目标已在 `#17` 达成。下一步建议继续做 1-2 轮 unattended soak，重点观察：
+下一步建议：
 
-1. `implement`
-2. `verify`
-3. `test`
-4. `pr`
-5. `review`
-6. terminal (`completed` / `failed`)
-7. 是否出现 `runningAtMs` 残留或需要 `kickstart` 才能恢复
+1. 固定 terminal 输出字段，减少 best-effort 解析
+2. 在收敛期间继续保留低频 unattended soak 监控（防回归）
+3. 若再次出现 `runningAtMs` 残留或频繁 `kickstart` 依赖，回退到稳定性专项排查
 
 ### 24.2 部署机最小执行步骤
 
@@ -2067,15 +2084,23 @@ tail -n 120 "$INSTANCE_ROOT/state/logs/gateway.err.log"
 8. 附上关键错误日志片段（若失败或卡住）。
 ```
 
-### 24.5 当前阶段完成标准
+### 24.5 当前阶段完成标准（已达成）
 
-满足以下条件即可进入下一阶段（输出契约收敛）：
+原稳定性门槛：
 
 1. 至少连续 3 次 unattended run 在新权限分离模型下跑到 terminal
 2. terminal 结果可被 Spacebot 面板稳定展示
 3. 无需人工 `step claim`
 4. 不依赖 `launchctl kickstart` 才能持续推进（允许偶发恢复，但不应成为每轮必需动作）
 5. 不再出现长期 `runningAtMs` 残留导致的步骤停滞
+
+当前判定（截至 `#19`）：
+
+1. ✅ 条件 1 已满足（`#17/#18/#19` 连续 terminal）
+2. ✅ 条件 3 已满足（上述 run 均无人工 `step claim`）
+3. ⚠️ 条件 4/5 仍建议继续观察，但已不阻塞进入“输出契约收敛”
+
+结论：本节门槛视为达成，后续进入输出契约阶段。
 
 ---
 
@@ -2093,15 +2118,13 @@ tail -n 120 "$INSTANCE_ROOT/state/logs/gateway.err.log"
 
 ### 25.2 下一步工作顺序
 
-1. 继续跑 1-2 轮 unattended soak，重点观察 `implement -> verify -> test -> pr -> review -> terminal`
-2. 每轮仅记录统一 6 字段（见 24.3），避免日志噪音淹没有效信号
+1. 进入输出契约收敛，先固定 `tester/reviewer` 的 terminal 字段
+2. 保留低频 unattended soak（按 24.3 的 6 字段）做回归监控
 3. 如再次卡住，优先归类为：
    - 运行时稳定性（cron/gateway/recovery）
    - workflow 输出契约问题（step 输出与 `Reply with` 不一致）
    - 目标 repo 任务适配问题（命令、分支、环境差异）
-4. 当满足 24.5 标准后，再进入“输出契约收敛”阶段：
-   - 固定 reviewer/tester 的 terminal 输出字段
-   - 减少 Spacebot 侧 best-effort 解析
+4. 契约收敛稳定后，再推进“4 库 + 测试”多仓闭环
 
 ### 25.3 当前阶段明确不优先做的事项
 

@@ -29,18 +29,18 @@
 后续请按分文档维护，不再把所有内容堆进单一 runbook。
 
 1. 架构与原则
-   - [agile_agent_team_architecture.md](/Users/applychart/Desktop/vibe-team/docs/agile_agent_team_architecture.md)
+   - [agile_agent_team_architecture.md](/Users/kris/Desktop/Dev/Vibe-Team/docs/agile_agent_team_architecture.md)
 2. 部署、联调、运行排障
-   - [deployment_and_integration_runbook.md](/Users/applychart/Desktop/vibe-team/docs/deployment_and_integration_runbook.md)
+   - [deployment_and_integration_runbook.md](/Users/kris/Desktop/Dev/Vibe-Team/docs/deployment_and_integration_runbook.md)
 3. 推进过程与关键节点（阶段记录）
-   - [progress.md](/Users/applychart/Desktop/vibe-team/docs/agent_team/progress.md)
+   - [progress.md](/Users/kris/Desktop/Dev/Vibe-Team/docs/agent_team/progress.md)
 4. 当前多仓闭环流程（4 库 + 测试）
-   - [workflow_web_4repos.md](/Users/applychart/Desktop/vibe-team/docs/agent_team/workflow_web_4repos.md)
+   - [workflow_web_4repos.md](/Users/kris/Desktop/Dev/Vibe-Team/docs/agent_team/workflow_web_4repos.md)
 
 ## 4. 当前执行顺序
 
-1. 继续 unattended soak，验证稳定可重复 terminal
-2. 达到稳定性基线后，收敛 terminal 输出契约
+1. 基于稳定性门槛达标，进入 terminal 输出契约收敛
+2. 并行保留低频 unattended soak 监控（防回归）
 3. 基于契约稳定版，推进多仓闭环 workflow
 4. 稳定后再考虑分工流程扩展（如 `feature-dev-split`）
 
@@ -52,3 +52,7 @@
 2. 无需人工 `step claim`
 3. 不依赖每轮 `kickstart` 才能推进
 4. `Spacebot` 面板能稳定展示 terminal 结果
+
+当前状态（2026-03-04）：
+
+- 该门槛已由 `#17 / #18 / #19` 达成，可进入“输出契约收敛”阶段。

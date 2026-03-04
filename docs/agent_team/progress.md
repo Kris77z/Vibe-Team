@@ -24,6 +24,7 @@
 4. unattended 运行达到 terminal：
    - `#17` 到 terminal (`completed`)
    - `#18` 再次到 terminal（中途暴露并修复 polling-only cleanup 触发点）
+   - `#19` 再次到 terminal（在修复后验证可重复性）
 
 ## 3. 当前状态判断
 
@@ -32,7 +33,8 @@
 已确认：
 
 1. 主链可跑通
-2. 至少两轮 unattended 可到 terminal
+2. 已连续三轮 unattended 到 terminal（`#17/#18/#19`）
+3. `#19` 全程无需人工 `step claim`
 
 仍需收敛：
 
@@ -44,9 +46,9 @@
 
 当前优先级：
 
-1. 继续 1-2 轮 unattended soak，验证可重复性
-2. 达标后进入输出契约收敛
-3. 然后推进“4 库 + 测试”多仓闭环 workflow
+1. 进入输出契约收敛阶段（基于已达成的稳定性门槛）
+2. 并行保留低频 unattended soak 监控（防回归）
+3. 推进“4 库 + 测试”多仓闭环 workflow
 
 不优先：
 
