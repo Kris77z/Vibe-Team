@@ -1,11 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useWebChat } from "@/hooks/useWebChat";
-import type { ActiveWorker } from "@/hooks/useChannelLiveState";
+import { isOpenCodeWorker, type ActiveWorker } from "@/hooks/useChannelLiveState";
 import { useLiveContext } from "@/hooks/useLiveContext";
-import { useConversationWorkflowRuns } from "@/hooks/useConversationWorkflowRuns";
 import { Markdown } from "@/components/Markdown";
-import { WorkflowLauncherDialog } from "@/components/WorkflowLauncherDialog";
-import { WorkflowRunsPanel } from "@/components/WorkflowRunsPanel";
 
 interface WebChatPanelProps {
 	agentId: string;
@@ -14,32 +11,43 @@ interface WebChatPanelProps {
 function ActiveWorkersPanel({ workers }: { workers: ActiveWorker[] }) {
 	if (workers.length === 0) return null;
 
+	// Use neutral chrome when all workers are opencode, amber when all builtin, mixed stays amber
+	const allOpenCode = workers.every(isOpenCodeWorker);
+	const borderColor = allOpenCode ? "border-zinc-500/25 bg-zinc-500/5" : "border-amber-500/25 bg-amber-500/5";
+	const headerColor = allOpenCode ? "text-zinc-200" : "text-amber-200";
+	const dotColor = allOpenCode ? "bg-zinc-400" : "bg-amber-400";
+
 	return (
-		<div className="rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2">
-			<div className="mb-2 flex items-center gap-1.5 text-tiny text-amber-200">
-				<div className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
+		<div className={`rounded-lg border px-3 py-2 ${borderColor}`}>
+			<div className={`mb-2 flex items-center gap-1.5 text-tiny ${headerColor}`}>
+				<div className={`h-1.5 w-1.5 animate-pulse rounded-full ${dotColor}`} />
 				<span>
 					{workers.length} active worker{workers.length !== 1 ? "s" : ""}
 				</span>
 			</div>
 			<div className="flex flex-col gap-1.5">
-				{workers.map((worker) => (
-					<div
-						key={worker.id}
-						className="flex min-w-0 items-center gap-2 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-tiny"
-					>
-						<span className="font-medium text-amber-300">Worker</span>
-						<span className="min-w-0 flex-1 truncate text-ink-dull">
-							{worker.task}
-						</span>
-						<span className="shrink-0 text-ink-faint">{worker.status}</span>
-						{worker.currentTool && (
-							<span className="max-w-40 shrink-0 truncate text-amber-400/80">
-								{worker.currentTool}
+				{workers.map((worker) => {
+					const oc = isOpenCodeWorker(worker);
+					return (
+						<div
+							key={worker.id}
+							className={`flex min-w-0 items-center gap-2 rounded-md px-2.5 py-1.5 text-tiny ${
+								oc ? "bg-zinc-500/10" : "bg-amber-500/10"
+							}`}
+						>
+							<span className={`font-medium ${oc ? "text-zinc-300" : "text-amber-300"}`}>Worker</span>
+							<span className="min-w-0 flex-1 truncate text-ink-dull">
+								{worker.task}
 							</span>
-						)}
-					</div>
-				))}
+							<span className="shrink-0 text-ink-faint">{worker.status}</span>
+							{worker.currentTool && (
+								<span className={`max-w-40 shrink-0 truncate ${oc ? "text-zinc-400/80" : "text-amber-400/80"}`}>
+									{worker.currentTool}
+								</span>
+							)}
+						</div>
+					);
+				})}
 			</div>
 		</div>
 	);
@@ -61,14 +69,12 @@ function FloatingChatInput({
 	onSubmit,
 	disabled,
 	agentId,
-	onOpenWorkflowLauncher,
 }: {
 	value: string;
 	onChange: (value: string) => void;
 	onSubmit: () => void;
 	disabled: boolean;
 	agentId: string;
-	onOpenWorkflowLauncher: () => void;
 }) {
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -105,13 +111,6 @@ function FloatingChatInput({
 			<div className="w-full max-w-2xl pointer-events-auto">
 				<div className="rounded-2xl border border-app-line/50 bg-app-box/40 backdrop-blur-xl shadow-xl transition-colors duration-200 hover:border-app-line/70">
 					<div className="flex items-end gap-2 p-3">
-						<button
-							type="button"
-							onClick={onOpenWorkflowLauncher}
-							className="shrink-0 rounded-lg border border-app-line/60 bg-app-box/60 px-2.5 py-1.5 text-xs font-medium text-ink-dull transition-colors hover:border-app-line hover:bg-app-box hover:text-ink"
-						>
-							Run Workflow
-						</button>
 						<textarea
 							ref={textareaRef}
 							value={value}
@@ -157,17 +156,13 @@ export function WebChatPanel({ agentId }: WebChatPanelProps) {
 	const { sessionId, isSending, error, sendMessage } = useWebChat(agentId);
 	const { liveStates } = useLiveContext();
 	const [input, setInput] = useState("");
-	const [launcherOpen, setLauncherOpen] = useState(false);
-	const [launcherNotice, setLauncherNotice] = useState<string | null>(null);
 	const messagesEndRef = useRef<HTMLDivElement>(null);
-	const { runs: workflowRuns } = useConversationWorkflowRuns(sessionId);
 
 	const liveState = liveStates[sessionId];
 	const timeline = liveState?.timeline ?? [];
 	const isTyping = liveState?.isTyping ?? false;
 	const activeWorkers = Object.values(liveState?.workers ?? {});
 	const hasActiveWorkers = activeWorkers.length > 0;
-	const hasWorkflowRuns = workflowRuns.length > 0;
 
 	// Auto-scroll on new messages or typing state changes
 	useEffect(() => {
@@ -181,27 +176,14 @@ export function WebChatPanel({ agentId }: WebChatPanelProps) {
 		sendMessage(trimmed);
 	};
 
-	const handleWorkflowStarted = ({
-		runId,
-		workflowId,
-	}: {
-		runId: string;
-		workflowId: string;
-	}) => {
-		setLauncherNotice(`Started ${workflowId} (${runId.slice(0, 8)})`);
-	};
-
 	return (
 		<div className="relative flex h-full w-full flex-col">
 			{/* Messages */}
 			<div className="flex-1 overflow-y-auto">
 				<div className="mx-auto flex max-w-2xl flex-col gap-6 px-4 py-6 pb-32">
-					{(hasActiveWorkers || hasWorkflowRuns) && (
+					{hasActiveWorkers && (
 						<div className="sticky top-0 z-10 bg-app/90 pb-2 pt-2 backdrop-blur-sm">
-							<div className="flex flex-col gap-2">
-								<WorkflowRunsPanel runs={workflowRuns} />
-								<ActiveWorkersPanel workers={activeWorkers} />
-							</div>
+							<ActiveWorkersPanel workers={activeWorkers} />
 						</div>
 					)}
 
@@ -240,11 +222,6 @@ export function WebChatPanel({ agentId }: WebChatPanelProps) {
 							{error}
 						</div>
 					)}
-					{launcherNotice && (
-						<div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-4 py-3 text-sm text-emerald-300">
-							{launcherNotice}
-						</div>
-					)}
 					<div ref={messagesEndRef} />
 				</div>
 			</div>
@@ -256,14 +233,6 @@ export function WebChatPanel({ agentId }: WebChatPanelProps) {
 				onSubmit={handleSubmit}
 				disabled={isSending || isTyping}
 				agentId={agentId}
-				onOpenWorkflowLauncher={() => setLauncherOpen(true)}
-			/>
-			<WorkflowLauncherDialog
-				agentId={agentId}
-				conversationId={sessionId}
-				open={launcherOpen}
-				onOpenChange={setLauncherOpen}
-				onStarted={handleWorkflowStarted}
 			/>
 		</div>
 	);

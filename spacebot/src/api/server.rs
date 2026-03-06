@@ -2,8 +2,8 @@
 
 use super::state::ApiState;
 use super::{
-    agents, antfarm, bindings, channels, config, cortex, cron, ingest, links, mcp, memories,
-    messaging, models, providers, secrets, settings, skills, system, tasks, tools, webchat,
+    agents, bindings, channels, config, cortex, cron, ingest, links, mcp, memories, messaging,
+    models, opencode_proxy, providers, secrets, settings, skills, system, tasks, tools, webchat,
     workers,
 };
 
@@ -14,7 +14,7 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use rust_embed::Embed;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
@@ -87,10 +87,15 @@ pub async fn start_http_server(
             "/channels",
             get(channels::list_channels).delete(channels::delete_channel),
         )
+        .route("/channels/archive", put(channels::set_channel_archive))
         .route("/channels/messages", get(channels::channel_messages))
         .route("/channels/status", get(channels::channel_status))
         .route("/agents/workers", get(workers::list_workers))
         .route("/agents/workers/detail", get(workers::worker_detail))
+        .route(
+            "/opencode/{port}/{*path}",
+            any(opencode_proxy::opencode_proxy),
+        )
         .route("/agents/memories", get(memories::list_memories))
         .route("/agents/memories/search", get(memories::search_memories))
         .route("/agents/memories/graph", get(memories::memory_graph))
@@ -128,16 +133,6 @@ pub async fn start_http_server(
             get(tasks::get_task)
                 .put(tasks::update_task)
                 .delete(tasks::delete_task),
-        )
-        .route("/antfarm/runs", post(antfarm::create_run))
-        .route("/antfarm/runs/{run_id}", get(antfarm::get_run))
-        .route(
-            "/antfarm/conversations/{conversation_id}/runs",
-            get(antfarm::list_conversation_runs),
-        )
-        .route(
-            "/antfarm/runs/{run_id}/result",
-            get(antfarm::get_run_result),
         )
         .route("/agents/tasks/{number}/approve", post(tasks::approve_task))
         .route("/agents/tasks/{number}/execute", post(tasks::execute_task))

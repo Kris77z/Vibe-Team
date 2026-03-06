@@ -1,3 +1,6 @@
+# Spacebot-only 配置模板（vibe-team）
+# 复制到: $HOME/instances/vibe-team/spacebot/config.toml
+
 [llm.provider.openai-relay]
 api_type = "openai_completions"
 base_url = "https://ai.co.link/openai"
@@ -15,5 +18,13 @@ enabled = true
 bind = "127.0.0.1"
 port = 19898
 
+[defaults]
+timezone = "Asia/Shanghai"
+
 [[agents]]
 id = "pm"
+name = "Vibe Team PM"
+
+# 最小可运行建议：
+# 1) 仅启用 webchat 或 API 入口
+# 2) 跑稳后再逐步加 Slack/Discord/Telegram 等 adapter

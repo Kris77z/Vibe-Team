@@ -1336,9 +1336,24 @@ async fn run(
     // Channel for removing agents from the main event loop
     let (agent_remove_tx, mut agent_remove_rx) = mpsc::channel::<String>(8);
 
+    // Channel for cross-agent message injection (e.g. delegated task completion notifications).
+    // The sender is shared with all agents via AgentDeps; the receiver is polled in the main loop.
+    let (injection_tx, mut injection_rx) =
+        tokio::sync::mpsc::channel::<spacebot::ChannelInjection>(64);
+
+    // Shared cross-agent task store registry. Populated after all agents are initialized.
+    let task_store_registry: Arc<
+        ArcSwap<std::collections::HashMap<String, Arc<spacebot::tasks::TaskStore>>>,
+    > = Arc::new(ArcSwap::from_pointee(std::collections::HashMap::new()));
+
     // Start HTTP API server if enabled
-    let mut api_state =
-        spacebot::api::ApiState::new_with_provider_sender(provider_tx, agent_tx, agent_remove_tx);
+    let mut api_state = spacebot::api::ApiState::new_with_provider_sender(
+        provider_tx,
+        agent_tx,
+        agent_remove_tx,
+        injection_tx.clone(),
+        task_store_registry.clone(),
+    );
     api_state.auth_token = config.api.auth_token.clone();
     let api_state = Arc::new(api_state);
 
@@ -1489,6 +1504,8 @@ async fn run(
             &mut telegram_permissions,
             &mut twitch_permissions,
             agent_links.clone(),
+            injection_tx.clone(),
+            task_store_registry.clone(),
             &bootstrapped_store,
         )
         .await?;
@@ -1590,6 +1607,11 @@ async fn run(
                         agent.config.screenshot_dir(),
                         agent.config.logs_dir(),
                     );
+                    agent
+                        .deps
+                        .process_control_registry
+                        .register_channel(channel.id.clone(), channel.control_handle().downgrade())
+                        .await;
 
                     // Register the channel's status block with the API for snapshot queries
                     api_state.register_channel_status(
@@ -1637,10 +1659,25 @@ async fn run(
                     }
 
                     // Spawn the channel's event loop
+                    let cleanup_channel_id = conversation_id.clone();
+                    let process_control_registry = agent.deps.process_control_registry.clone();
+                    let api_state_for_cleanup = api_state.clone();
                     tokio::spawn(async move {
                         if let Err(error) = channel.run().await {
                             tracing::error!(%error, "channel event loop failed");
                         }
+
+                        let scoped_channel_id: spacebot::ChannelId =
+                            Arc::from(cleanup_channel_id.as_str());
+                        process_control_registry
+                            .unregister_channel(&scoped_channel_id)
+                            .await;
+                        api_state_for_cleanup
+                            .unregister_channel_status(&cleanup_channel_id)
+                            .await;
+                        api_state_for_cleanup
+                            .unregister_channel_state(&cleanup_channel_id)
+                            .await;
                     });
 
                     // Spawn outbound response routing: reads from response_rx,
@@ -1779,6 +1816,32 @@ async fn run(
                     tracing::warn!(agent_id = %agent_id, "agent not found in main loop for removal");
                 }
             }
+            // Cross-agent message injection (e.g. delegated task completion retrigger).
+            // Forwards the injected message to the target channel if it exists.
+            Some(injection) = injection_rx.recv() => {
+                if let Some(active) = active_channels.get(&injection.conversation_id) {
+                    if let Err(error) = active.message_tx.send(injection.message).await {
+                        tracing::warn!(
+                            %error,
+                            conversation_id = %injection.conversation_id,
+                            agent_id = %injection.agent_id,
+                            "failed to forward injected message to channel"
+                        );
+                    } else {
+                        tracing::info!(
+                            conversation_id = %injection.conversation_id,
+                            agent_id = %injection.agent_id,
+                            "forwarded cross-agent injection to active channel"
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        conversation_id = %injection.conversation_id,
+                        agent_id = %injection.agent_id,
+                        "injection target channel not active, notification will be delivered on next message"
+                    );
+                }
+            }
             Some(_event) = provider_rx.recv(), if !agents_initialized => {
                 tracing::info!("providers configured, initializing agents");
 
@@ -1832,6 +1895,8 @@ async fn run(
                                     &mut new_telegram_permissions,
                                     &mut new_twitch_permissions,
                                     agent_links.clone(),
+                                    injection_tx.clone(),
+                                    task_store_registry.clone(),
                                     &bootstrapped_store,
                                 ).await {
                                     Ok(()) => {
@@ -1966,6 +2031,10 @@ async fn initialize_agents(
     telegram_permissions: &mut Option<Arc<ArcSwap<spacebot::config::TelegramPermissions>>>,
     twitch_permissions: &mut Option<Arc<ArcSwap<spacebot::config::TwitchPermissions>>>,
     agent_links: Arc<ArcSwap<Vec<spacebot::links::AgentLink>>>,
+    injection_tx: tokio::sync::mpsc::Sender<spacebot::ChannelInjection>,
+    task_store_registry: Arc<
+        ArcSwap<std::collections::HashMap<String, Arc<spacebot::tasks::TaskStore>>>,
+    >,
     bootstrapped_store: &Option<Arc<spacebot::secrets::store::SecretsStore>>,
 ) -> anyhow::Result<()> {
     let resolved_agents = config.resolve_agents();
@@ -2026,6 +2095,27 @@ async fn initialize_agents(
                 )
             })?;
 
+        let run_logger = spacebot::conversation::ProcessRunLogger::new(db.sqlite.clone());
+        let orphaned_workers = run_logger
+            .reconcile_running_workers_for_agent(
+                &agent_config.id,
+                "Worker interrupted: Spacebot restarted before completion.",
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to reconcile stale running workers for agent '{}'",
+                    agent_config.id
+                )
+            })?;
+        if orphaned_workers > 0 {
+            tracing::warn!(
+                agent_id = %agent_config.id,
+                orphaned_workers,
+                "marked stale running workers as failed during startup"
+            );
+        }
+
         // Per-agent settings store (redb-backed)
         let settings_path = agent_config.data_dir.join("settings.redb");
         let settings_store = Arc::new(
@@ -2058,8 +2148,8 @@ async fn initialize_agents(
             embedding_model.clone(),
         ));
 
-        // Per-agent event bus (broadcast for fan-out to multiple channels)
-        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(256);
+        // Per-agent control and memory event buses (broadcast fan-out).
+        let (event_tx, memory_event_tx) = spacebot::create_process_event_buses();
 
         let agent_id: spacebot::AgentId = Arc::from(agent_config.id.as_str());
         let mcp_manager = Arc::new(spacebot::mcp::McpManager::new(agent_config.mcp.clone()));
@@ -2092,7 +2182,12 @@ async fn initialize_agents(
         ));
 
         // Set the settings store in RuntimeConfig and apply config-driven defaults
-        runtime_config.set_settings(settings_store.clone());
+        let explicit_listen_only = config
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_config.id)
+            .and_then(|agent| agent.channel.map(|channel| channel.listen_only_mode));
+        runtime_config.set_settings(settings_store.clone(), explicit_listen_only);
         if let Err(error) = settings_store.set_worker_log_mode(config.defaults.worker_log_mode) {
             tracing::warn!(%error, agent = %agent_config.id, "failed to set worker_log_mode from config");
         }
@@ -2134,11 +2229,17 @@ async fn initialize_agents(
             cron_tool: None,
             runtime_config,
             event_tx,
+            memory_event_tx,
             sqlite_pool: db.sqlite.clone(),
             messaging_manager: None,
             sandbox,
             links: agent_links.clone(),
             agent_names: agent_name_map.clone(),
+            task_store_registry: task_store_registry.clone(),
+            process_control_registry: Arc::new(
+                spacebot::agent::process_control::ProcessControlRegistry::new(),
+            ),
+            injection_tx: injection_tx.clone(),
         };
 
         let agent = spacebot::Agent {
@@ -2150,6 +2251,40 @@ async fn initialize_agents(
 
         tracing::info!(agent_id = %agent_config.id, "agent initialized");
         agents.insert(agent_id, agent);
+    }
+
+    // Populate the cross-agent task store registry now that all agents exist.
+    {
+        let registry: std::collections::HashMap<String, Arc<spacebot::tasks::TaskStore>> = agents
+            .iter()
+            .map(|(agent_id, agent)| (agent_id.to_string(), agent.deps.task_store.clone()))
+            .collect();
+        task_store_registry.store(Arc::new(registry));
+    }
+
+    // Pre-register both sides of every link channel so they appear in each
+    // agent's channel list from boot. The actual Channel instances are spawned
+    // on-demand when the first message arrives; this just creates the DB records
+    // so the UI can display them.
+    {
+        let all_links = agent_links.load();
+        let empty_meta = std::collections::HashMap::new();
+        for link in all_links.iter() {
+            let from_channel = link.channel_id_for(&link.from_agent_id);
+            let to_channel = link.channel_id_for(&link.to_agent_id);
+
+            if let Some(agent) = agents.get(&Arc::from(link.from_agent_id.as_str())) {
+                let store = spacebot::conversation::ChannelStore::new(agent.db.sqlite.clone());
+                store.upsert(&from_channel, &empty_meta);
+            }
+            if let Some(agent) = agents.get(&Arc::from(link.to_agent_id.as_str())) {
+                let store = spacebot::conversation::ChannelStore::new(agent.db.sqlite.clone());
+                store.upsert(&to_channel, &empty_meta);
+            }
+        }
+        if !all_links.is_empty() {
+            tracing::info!(link_count = all_links.len(), "pre-registered link channels");
+        }
     }
 
     tracing::info!(agent_count = agents.len(), "all agents initialized");
@@ -2198,7 +2333,6 @@ async fn initialize_agents(
             api_state.set_secrets_store(store.clone());
         }
         api_state.set_instance_dir(config.instance_dir.clone());
-        api_state.restore_persisted_workflow_run_bindings().await;
     }
 
     // Run a startup warmup pass for every agent before adapters begin receiving
@@ -2662,7 +2796,7 @@ async fn initialize_agents(
         }
     }
 
-    // Start cortex warmup, bulletin loops, and association loops for each agent
+    // Start cortex warmup, runtime, and association loops for each agent
     for (agent_id, agent) in agents.iter() {
         let cortex_logger = spacebot::agent::cortex::CortexLogger::new(agent.db.sqlite.clone());
         let warmup_handle =
@@ -2670,10 +2804,10 @@ async fn initialize_agents(
         cortex_handles.push(warmup_handle);
         tracing::info!(agent_id = %agent_id, "warmup loop started");
 
-        let bulletin_handle =
-            spacebot::agent::cortex::spawn_bulletin_loop(agent.deps.clone(), cortex_logger.clone());
-        cortex_handles.push(bulletin_handle);
-        tracing::info!(agent_id = %agent_id, "cortex bulletin loop started");
+        let cortex_handle =
+            spacebot::agent::cortex::spawn_cortex_loop(agent.deps.clone(), cortex_logger.clone());
+        cortex_handles.push(cortex_handle);
+        tracing::info!(agent_id = %agent_id, "cortex loop started");
 
         let association_handle =
             spacebot::agent::cortex::spawn_association_loop(agent.deps.clone(), cortex_logger);
@@ -2702,6 +2836,7 @@ async fn initialize_agents(
                 agent.deps.agent_id.clone(),
                 agent.deps.task_store.clone(),
                 agent.deps.memory_search.clone(),
+                agent.deps.memory_event_tx.clone(),
                 conversation_logger,
                 channel_store,
                 run_logger,
@@ -2710,6 +2845,7 @@ async fn initialize_agents(
                 brave_search_key,
                 agent.deps.runtime_config.workspace_dir.clone(),
                 agent.deps.sandbox.clone(),
+                agent.deps.runtime_config.clone(),
             );
             let store = spacebot::agent::cortex_chat::CortexChatStore::new(agent.db.sqlite.clone());
             let session = spacebot::agent::cortex_chat::CortexChatSession::new(

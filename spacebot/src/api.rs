@@ -5,7 +5,6 @@
 //! Includes an SSE endpoint for realtime event streaming.
 
 mod agents;
-mod antfarm;
 mod bindings;
 mod channels;
 mod config;
@@ -17,6 +16,7 @@ mod mcp;
 mod memories;
 mod messaging;
 mod models;
+mod opencode_proxy;
 mod providers;
 mod secrets;
 mod server;
@@ -30,4 +30,4 @@ mod webchat;
 mod workers;
 
 pub use server::start_http_server;
-pub use state::{AgentInfo, ApiEvent, ApiState, WorkflowRunBinding};
+pub use state::{AgentInfo, ApiEvent, ApiState};

@@ -1,71 +1,86 @@
-# Agent Team 推进记录与关键节点
+# Agent Team 推进记录（重建版）
 
 ## 1. 记录规则
 
 本文件只记录：
 
-1. 阶段目标变化
-2. 关键里程碑
-3. 阻塞与修复结论
-4. 下一步决策
+1. 阶段目标
+2. 里程碑
+3. Gate 结果
+4. 阻塞与处置
+5. 下一步动作
 
-不记录逐条调试噪音日志。详细命令与排障细节仍放 runbook。
+不记录逐条调试噪音。
 
-## 2. 已达成里程碑
+## 2. 基线重启记录
 
-### 2026-03-03 ~ 2026-03-04
+### 2026-03-06：R0 重建启动
 
-1. 远程使用链路打通：
-   - 开发机通过 Tailscale + SSH 访问部署机 Spacebot UI
-2. `Spacebot -> Antfarm` 真实触发链路可用：
-   - 可从 Spacebot UI 发起 run
-3. 权限分离模型落地：
-   - workflow worker 与 `__cron` helper 分离
-4. unattended 运行达到 terminal：
-   - `#17` 到 terminal (`completed`)
-   - `#18` 再次到 terminal（中途暴露并修复 polling-only cleanup 触发点）
-   - `#19` 再次到 terminal（在修复后验证可重复性）
+结论：
 
-## 3. 当前状态判断
+1. 方向统一为 `Spacebot-only`
+2. 三系统链路降级为历史参考，不作为当前主链
+3. 启动“从零基线重建”
 
-当前状态不是“能不能跑通”，而是“稳定性是否足够可重复”。
+已完成：
 
-已确认：
+1. 路线文档重写
+2. 主文档重写
+3. 部署手册重写（待同步验证）
+4. 启动脚本与配置模板重建（待执行验证）
+5. `spacebot/scripts/gate-pr.sh` 已改为兼容 macOS 默认 Bash 3.2
+6. `spacebot/scripts/preflight.sh` 与 `gate-pr.sh` 已增加 rustup toolchain 优先
+7. Gate 回归通过：`preflight --ci` + `gate-pr --ci --fast`（428 tests passed）
+8. 修复本轮 Gate 阻塞：
+   - config 测试环境隔离补齐 `ANTHROPIC_AUTH_TOKEN`
+   - metadata search 测试去除 embedding 模型下载依赖
+9. 新增单仓闭环执行手册：`docs/agent_team/single_repo_closure.md`
+10. 新增单仓闭环一键留痕脚本：`drafts/run-single-repo-closure.sh`
 
-1. 主链可跑通
-2. 已连续三轮 unattended 到 terminal（`#17/#18/#19`）
-3. `#19` 全程无需人工 `step claim`
+### 2026-03-06：R1 单仓闭环样例（Spacebot）
 
-仍需收敛：
+run_id：`single-20260306-174729`
 
-1. 降低 `kickstart` 恢复依赖
-2. 降低 `runningAtMs` 残留导致的卡顿概率
-3. 收敛 terminal 结构化输出，减少 best-effort 解析
+证据目录：`docs/agent_team/runs/single-20260306-174729/`
 
-### 2026-03-04（输出契约收敛启动）
+Gate 结果：
 
-已完成（代码侧）：
+1. Gate A：PASS（契约说明已记录）
+2. Gate B：PASS（`preflight --ci` + `gate-pr --ci --fast`）
+3. Gate C：PASS（本轮未配置 smoke，按空命令跳过）
 
-1. `feature-dev` 的 `review` 步骤输出新增 `FINAL_RESULT_JSON`（单行 JSON）
-2. `Spacebot` 终态结果解析改为：优先读 `FINAL_RESULT_JSON`，缺失时回退旧键值输出（`CHANGES/TESTS/DECISION/BRANCH/PR`）
-3. `PR: skipped ...` 不再被误识别为 `pr_url`
+### 2026-03-06：R2 / R3 单仓闭环复跑（Spacebot）
 
-待验证（部署机）：
+run_id：
 
-1. 重新安装 workflow 后发起一轮 unattended run
-2. 在 Spacebot UI 确认 terminal 字段稳定展示
-3. 验证旧 run（无 JSON 契约）仍可回显结果
+1. `single-20260306-174913`
+2. `single-20260306-174922`
 
-## 4. 下一步决策
+证据目录：
 
-当前优先级：
+1. `docs/agent_team/runs/single-20260306-174913/`
+2. `docs/agent_team/runs/single-20260306-174922/`
 
-1. 进入输出契约收敛阶段（基于已达成的稳定性门槛）
-2. 并行保留低频 unattended soak 监控（防回归）
-3. 推进“4 库 + 测试”多仓闭环 workflow
+Gate 结果：
 
-不优先：
+1. 两轮均为 A/B/C 全 PASS
+2. `gate-pr` 两轮均通过（`428 passed, 0 failed`）
+3. 累计单仓闭环通过次数达到 3 次（R1 + R2 + R3）
+4. 新增 4 仓执行清单模板：`docs/agent_team/workflow_web_4repos_checklist.md`
+5. 新增 4 仓串行执行脚本：`drafts/run-4repo-closure.sh`
+6. 4 仓执行器 dry-run 通过：`fourrepo-20260306-175155`
+7. 4 仓真实路径预填清单：`workflow_web_4repos_checklist.aicoin_web.md`
+8. 代理环境下 4 仓实跑：`fourrepo-20260306-180052`（collector test 失败）
 
-1. UI 细化
-2. Dashboard 嵌入
-3. 过早切到复杂并行 workflow
+## 3. 当前阻塞
+
+当前阻塞（4 仓阶段）：
+
+1. collector (`data-spider`) `go test ./...` 失败
+2. 失败类型包含编译错误、Redis 依赖缺失、业务测试断言失败
+
+## 4. 下一步
+
+1. 切换到 4 仓串行闭环（collector -> shared-data -> api -> frontend -> integration-test）
+2. 为 4 仓流程补每仓命令与通过标准清单
+3. 执行首轮 4 仓闭环并沉淀证据目录

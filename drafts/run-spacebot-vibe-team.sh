@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export INSTANCE_ROOT="/Users/kris/instances/vibe-team"
-export SPACEBOT_DIR="$INSTANCE_ROOT/spacebot"
-export OPENCLAW_STATE_DIR="$INSTANCE_ROOT/state"
-export OPENAI_AUTH_KEY="${OPENAI_AUTH_KEY:?OPENAI_AUTH_KEY is required}"
-export SPACEBOT_ANTFARM_DASHBOARD_URL="http://127.0.0.1:3333"
-export SPACEBOT_ANTFARM_CLI_PATH="$INSTANCE_ROOT/bin/antfarm-vibe-team"
-export SPACEBOT_ANTFARM_WORKDIR="/Users/kris/Desktop/Dev"
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
-export https_proxy="http://127.0.0.1:7890"
-export http_proxy="http://127.0.0.1:7890"
-export all_proxy="socks5://127.0.0.1:7890"
-export NO_PROXY="127.0.0.1,localhost"
-export no_proxy="127.0.0.1,localhost"
+# Spacebot-only 启动脚本（前台）
+# 用法：
+#   OPENAI_AUTH_KEY=... ./drafts/run-spacebot-vibe-team.sh
 
-exec "$INSTANCE_ROOT/bin/spacebot" \
-  --config "$SPACEBOT_DIR/config.toml" \
+export INSTANCE_ROOT="${INSTANCE_ROOT:-$HOME/instances/vibe-team}"
+export SPACEBOT_HOME="${SPACEBOT_HOME:-$INSTANCE_ROOT/spacebot}"
+export SPACEBOT_DIR="${SPACEBOT_DIR:-$SPACEBOT_HOME/data}"
+export SPACEBOT_BIN="${SPACEBOT_BIN:-$INSTANCE_ROOT/bin/spacebot}"
+export SPACEBOT_CONFIG="${SPACEBOT_CONFIG:-$SPACEBOT_HOME/config.toml}"
+
+if [[ ! -x "$SPACEBOT_BIN" ]]; then
+  echo "[run-spacebot] missing executable: $SPACEBOT_BIN" >&2
+  exit 1
+fi
+
+if [[ ! -f "$SPACEBOT_CONFIG" ]]; then
+  echo "[run-spacebot] missing config: $SPACEBOT_CONFIG" >&2
+  exit 1
+fi
+
+mkdir -p "$SPACEBOT_DIR"
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+exec "$SPACEBOT_BIN" \
+  --config "$SPACEBOT_CONFIG" \
   start \
   --foreground

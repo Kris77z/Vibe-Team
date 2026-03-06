@@ -4,10 +4,7 @@ use crate::agent::channel::ChannelState;
 use crate::agent::cortex_chat::CortexChatSession;
 use crate::agent::status::StatusBlock;
 use crate::config::{Binding, DefaultsConfig, DiscordPermissions, RuntimeConfig, SlackPermissions};
-use crate::conversation::{ChannelStore, WorkflowRunBindingStore};
 use crate::cron::{CronStore, Scheduler};
-use crate::integrations::antfarm::{AntfarmCliService, AntfarmService, MockAntfarmService};
-use crate::integrations::antfarm::{FinalRunResult, RunBlockingState, RunSummary};
 use crate::llm::LlmManager;
 use crate::mcp::McpManager;
 use crate::memory::{EmbeddingModel, MemorySearch};
@@ -40,33 +37,6 @@ pub struct AgentInfo {
     pub max_turns: usize,
     pub max_concurrent_branches: usize,
     pub max_concurrent_workers: usize,
-}
-
-/// Binding between a Spacebot conversation and an Antfarm workflow run.
-#[derive(Debug, Clone)]
-pub struct WorkflowRunBinding {
-    pub request_id: String,
-    pub conversation_id: String,
-    pub run_id: String,
-    pub workflow_id: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkflowRunSnapshot {
-    status: String,
-    current_step: Option<String>,
-    current_agent: Option<String>,
-    story_done: usize,
-    story_total: usize,
-    blocking_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct WorkflowRunPollState {
-    poller_running: bool,
-    last_snapshot: Option<WorkflowRunSnapshot>,
-    terminal_emitted: bool,
 }
 
 /// State shared across all API handlers.
@@ -134,18 +104,11 @@ pub struct ApiState {
     pub agent_remove_tx: mpsc::Sender<String>,
     /// Shared webchat adapter for session management from API handlers.
     pub webchat_adapter: ArcSwap<Option<Arc<WebChatAdapter>>>,
-    /// Optional Antfarm integration service.
-    ///
-    /// Default is `None`.
-    /// Development-only mock: `SPACEBOT_ENABLE_ANTFARM_MOCK=1`
-    /// Real deployment service: set `SPACEBOT_ANTFARM_DASHBOARD_URL`
-    /// and optionally `SPACEBOT_ANTFARM_CLI_PATH`,
-    /// `SPACEBOT_ANTFARM_WORKDIR`, `SPACEBOT_ANTFARM_NOTIFY_URL`.
-    pub antfarm_service: RwLock<Option<Arc<dyn AntfarmService>>>,
-    /// Bind workflow runs back to the originating conversation.
-    pub workflow_run_bindings: RwLock<HashMap<String, WorkflowRunBinding>>,
-    /// Poll state for active Antfarm workflow runs.
-    workflow_run_poll_states: RwLock<HashMap<String, WorkflowRunPollState>>,
+    /// Cross-agent task store registry for delegation.
+    pub task_store_registry:
+        Arc<ArcSwap<std::collections::HashMap<String, Arc<crate::tasks::TaskStore>>>>,
+    /// Sender for cross-agent message injection.
+    pub injection_tx: mpsc::Sender<crate::ChannelInjection>,
     /// Instance-level agent links for the communication graph.
     pub agent_links: ArcSwap<Vec<crate::links::AgentLink>>,
     /// Visual agent groups for the topology UI.
@@ -178,6 +141,13 @@ pub enum ApiEvent {
         channel_id: String,
         is_typing: bool,
     },
+    /// Streaming text delta for an outbound assistant message.
+    OutboundMessageDelta {
+        agent_id: String,
+        channel_id: String,
+        text_delta: String,
+        aggregated_text: String,
+    },
     /// A worker was started.
     WorkerStarted {
         agent_id: String,
@@ -185,6 +155,7 @@ pub enum ApiEvent {
         worker_id: String,
         task: String,
         worker_type: String,
+        interactive: bool,
     },
     /// A worker's status changed.
     WorkerStatusUpdate {
@@ -192,6 +163,12 @@ pub enum ApiEvent {
         channel_id: Option<String>,
         worker_id: String,
         status: String,
+    },
+    /// A worker entered the idle state (waiting for follow-up input).
+    WorkerIdle {
+        agent_id: String,
+        channel_id: Option<String>,
+        worker_id: String,
     },
     /// A worker completed.
     WorkerCompleted {
@@ -257,123 +234,25 @@ pub enum ApiEvent {
         /// "created", "updated", or "deleted".
         action: String,
     },
-    /// An external workflow run was started for a conversation.
-    WorkflowRunStarted {
-        conversation_id: String,
-        run_id: String,
-        workflow_id: String,
-        status: String,
-        run_number: Option<i64>,
+    /// A finalized content part from an OpenCode worker session.
+    OpenCodePartUpdated {
+        agent_id: String,
+        worker_id: String,
+        part: crate::opencode::types::OpenCodePart,
     },
-    /// An external workflow run has new summary state.
-    WorkflowRunUpdated {
-        conversation_id: String,
-        run_id: String,
-        workflow_id: String,
-        status: String,
-        current_step: Option<String>,
-        current_agent: Option<String>,
-        story_done: usize,
-        story_total: usize,
-        blocking_reason: Option<String>,
-    },
-    /// An external workflow run completed and returned a terminal result.
-    WorkflowRunCompleted {
-        conversation_id: String,
-        run_id: String,
-        workflow_id: String,
-        result: serde_json::Value,
-    },
-    /// An external workflow run failed or ended unsuccessfully.
-    WorkflowRunFailed {
-        conversation_id: String,
-        run_id: String,
-        workflow_id: String,
-        status: String,
-        reason: String,
-    },
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-fn antfarm_service_from_env() -> Option<Arc<dyn AntfarmService>> {
-    if env_flag("SPACEBOT_ENABLE_ANTFARM_MOCK") {
-        tracing::warn!(
-            "SPACEBOT_ENABLE_ANTFARM_MOCK is enabled; using mock Antfarm service for development only"
-        );
-        return Some(Arc::new(MockAntfarmService::new()) as Arc<dyn AntfarmService>);
-    }
-
-    let dashboard_url = std::env::var("SPACEBOT_ANTFARM_DASHBOARD_URL").ok()?;
-    let antfarm_path =
-        std::env::var("SPACEBOT_ANTFARM_CLI_PATH").unwrap_or_else(|_| "antfarm".to_string());
-    let working_dir = std::env::var("SPACEBOT_ANTFARM_WORKDIR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from);
-    let notify_url = std::env::var("SPACEBOT_ANTFARM_NOTIFY_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-
-    tracing::info!(
-        antfarm_path = %antfarm_path,
-        dashboard_url = %dashboard_url,
-        working_dir = ?working_dir,
-        "enabling Antfarm CLI-backed integration from environment"
-    );
-
-    Some(Arc::new(AntfarmCliService::new(
-        antfarm_path,
-        dashboard_url,
-        working_dir,
-        notify_url,
-    )) as Arc<dyn AntfarmService>)
-}
-
-fn run_blocking_reason(value: &Option<RunBlockingState>) -> Option<String> {
-    value.as_ref().map(|blocking| match blocking {
-        RunBlockingState::HumanInputRequired { reason } => reason.clone(),
-        RunBlockingState::Retrying { reason } => reason.clone(),
-        RunBlockingState::InfraError { reason } => reason.clone(),
-    })
-}
-
-fn run_snapshot(summary: &RunSummary) -> WorkflowRunSnapshot {
-    WorkflowRunSnapshot {
-        status: summary.status.clone(),
-        current_step: summary.current_step.clone(),
-        current_agent: summary.current_agent.clone(),
-        story_done: summary.story_progress.done,
-        story_total: summary.story_progress.total,
-        blocking_reason: run_blocking_reason(&summary.blocking),
-    }
-}
-
-fn is_terminal_run_status(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled")
 }
 
 impl ApiState {
-    fn resolve_agent_pool_for_portal_session(
-        &self,
-        conversation_id: &str,
-    ) -> Option<sqlx::SqlitePool> {
-        let agent_id = conversation_id.strip_prefix("portal:chat:")?;
-        self.agent_pools.load().get(agent_id).cloned()
-    }
-
     pub fn new_with_provider_sender(
         provider_setup_tx: mpsc::Sender<crate::ProviderSetupEvent>,
         agent_tx: mpsc::Sender<crate::Agent>,
         agent_remove_tx: mpsc::Sender<String>,
+        injection_tx: mpsc::Sender<crate::ChannelInjection>,
+        task_store_registry: Arc<
+            ArcSwap<std::collections::HashMap<String, Arc<crate::tasks::TaskStore>>>,
+        >,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(512);
-        let antfarm_service = antfarm_service_from_env();
         Self {
             started_at: Instant::now(),
             auth_token: None,
@@ -406,10 +285,9 @@ impl ApiState {
             defaults_config: RwLock::new(None),
             agent_tx,
             agent_remove_tx,
+            task_store_registry,
+            injection_tx,
             webchat_adapter: ArcSwap::from_pointee(None),
-            antfarm_service: RwLock::new(antfarm_service),
-            workflow_run_bindings: RwLock::new(HashMap::new()),
-            workflow_run_poll_states: RwLock::new(HashMap::new()),
             agent_links: ArcSwap::from_pointee(Vec::new()),
             agent_groups: ArcSwap::from_pointee(Vec::new()),
             agent_humans: ArcSwap::from_pointee(Vec::new()),
@@ -462,6 +340,7 @@ impl ApiState {
                                 channel_id,
                                 task,
                                 worker_type,
+                                interactive,
                                 ..
                             } => {
                                 api_tx
@@ -471,6 +350,7 @@ impl ApiState {
                                         worker_id: worker_id.to_string(),
                                         task: task.clone(),
                                         worker_type: worker_type.clone(),
+                                        interactive: *interactive,
                                     })
                                     .ok();
                             }
@@ -501,6 +381,19 @@ impl ApiState {
                                         channel_id: channel_id.as_deref().map(|s| s.to_string()),
                                         worker_id: worker_id.to_string(),
                                         status: status.clone(),
+                                    })
+                                    .ok();
+                            }
+                            ProcessEvent::WorkerIdle {
+                                worker_id,
+                                channel_id,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::WorkerIdle {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.as_deref().map(|s| s.to_string()),
+                                        worker_id: worker_id.to_string(),
                                     })
                                     .ok();
                             }
@@ -621,13 +514,52 @@ impl ApiState {
                                     })
                                     .ok();
                             }
+                            ProcessEvent::TextDelta {
+                                channel_id: Some(channel_id),
+                                text_delta,
+                                aggregated_text,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::OutboundMessageDelta {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.to_string(),
+                                        text_delta: text_delta.clone(),
+                                        aggregated_text: aggregated_text.clone(),
+                                    })
+                                    .ok();
+                            }
+                            ProcessEvent::OpenCodePartUpdated {
+                                worker_id, part, ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::OpenCodePartUpdated {
+                                        agent_id: agent_id.clone(),
+                                        worker_id: worker_id.to_string(),
+                                        part: part.clone(),
+                                    })
+                                    .ok();
+                            }
                             _ => {}
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(count)) => {
-                        tracing::debug!(agent_id = %agent_id, count, "API event forwarder lagged, skipped events");
+                    Err(error) => {
+                        match crate::classify_broadcast_recv_result::<crate::ProcessEvent>(Err(
+                            error,
+                        )) {
+                            crate::BroadcastRecvResult::Lagged(count) => {
+                                tracing::debug!(
+                                    agent_id = %agent_id,
+                                    count,
+                                    "API event forwarder lagged, skipped events"
+                                );
+                            }
+                            crate::BroadcastRecvResult::Closed => break,
+                            crate::BroadcastRecvResult::Event(_) => unreachable!(
+                                "classifying an Err recv result should never produce Event"
+                            ),
+                        }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -747,293 +679,6 @@ impl ApiState {
     /// Set the shared webchat adapter for API handlers.
     pub fn set_webchat_adapter(&self, adapter: Arc<WebChatAdapter>) {
         self.webchat_adapter.store(Arc::new(Some(adapter)));
-    }
-
-    /// Set the Antfarm integration service.
-    ///
-    /// This should be called by real runtime wiring once a production adapter is
-    /// available. The env-gated mock exists only for development on the
-    /// non-deployment machine.
-    pub async fn set_antfarm_service(&self, service: Arc<dyn AntfarmService>) {
-        *self.antfarm_service.write().await = Some(service);
-    }
-
-    /// Get the currently configured Antfarm integration service, if any.
-    pub async fn get_antfarm_service(&self) -> Option<Arc<dyn AntfarmService>> {
-        self.antfarm_service.read().await.clone()
-    }
-
-    /// Record the conversation binding for a workflow run.
-    pub async fn register_workflow_run_binding(&self, binding: WorkflowRunBinding) {
-        self.workflow_run_poll_states
-            .write()
-            .await
-            .entry(binding.run_id.clone())
-            .or_default();
-        self.workflow_run_bindings
-            .write()
-            .await
-            .insert(binding.run_id.clone(), binding);
-    }
-
-    async fn resolve_pool_for_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Option<sqlx::SqlitePool> {
-        if let Some(pool) = self.resolve_agent_pool_for_portal_session(conversation_id) {
-            return Some(pool);
-        }
-
-        let pools: Vec<sqlx::SqlitePool> = self.agent_pools.load().values().cloned().collect();
-        for pool in pools {
-            let store = ChannelStore::new(pool.clone());
-            match store.get(conversation_id).await {
-                Ok(Some(_)) => return Some(pool),
-                Ok(None) => continue,
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        conversation_id = %conversation_id,
-                        "failed while resolving conversation pool for workflow binding"
-                    );
-                }
-            }
-        }
-
-        None
-    }
-
-    pub async fn persist_workflow_run_binding(
-        &self,
-        binding: &WorkflowRunBinding,
-    ) -> crate::error::Result<()> {
-        let Some(pool) = self
-            .resolve_pool_for_conversation(&binding.conversation_id)
-            .await
-        else {
-            return Err(anyhow::anyhow!(
-                "no agent SQLite pool found for workflow conversation '{}'",
-                binding.conversation_id
-            )
-            .into());
-        };
-
-        WorkflowRunBindingStore::new(pool)
-            .upsert_binding(binding)
-            .await
-    }
-
-    /// Look up a workflow run binding by run ID.
-    pub async fn get_workflow_run_binding(&self, run_id: &str) -> Option<WorkflowRunBinding> {
-        self.workflow_run_bindings.read().await.get(run_id).cloned()
-    }
-
-    /// List workflow run bindings for a conversation.
-    pub async fn list_workflow_run_bindings_for_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Vec<WorkflowRunBinding> {
-        self.workflow_run_bindings
-            .read()
-            .await
-            .values()
-            .filter(|binding| binding.conversation_id == conversation_id)
-            .cloned()
-            .collect()
-    }
-
-    pub async fn restore_persisted_workflow_run_bindings(self: &Arc<Self>) {
-        let pools: Vec<sqlx::SqlitePool> = self.agent_pools.load().values().cloned().collect();
-        let mut restored = std::collections::HashMap::<String, WorkflowRunBinding>::new();
-
-        for pool in pools {
-            let store = WorkflowRunBindingStore::new(pool);
-            match store.list_bindings().await {
-                Ok(bindings) => {
-                    for binding in bindings {
-                        restored.entry(binding.run_id.clone()).or_insert(binding);
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "failed to restore persisted workflow run bindings");
-                }
-            }
-        }
-
-        if restored.is_empty() {
-            return;
-        }
-
-        self.workflow_run_bindings
-            .write()
-            .await
-            .extend(restored.clone());
-        self.workflow_run_poll_states.write().await.extend(
-            restored
-                .keys()
-                .cloned()
-                .map(|run_id| (run_id, WorkflowRunPollState::default())),
-        );
-
-        let Some(service) = self.get_antfarm_service().await else {
-            tracing::info!(
-                binding_count = restored.len(),
-                "restored workflow run bindings without starting pollers because no Antfarm service is configured"
-            );
-            return;
-        };
-
-        for binding in restored.values() {
-            match service.get_run_summary(&binding.run_id).await {
-                Ok(summary) if !is_terminal_run_status(&summary.status) => {
-                    self.ensure_workflow_run_poller(binding.run_id.clone())
-                        .await;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        run_id = %binding.run_id,
-                        "failed to inspect restored workflow run state"
-                    );
-                }
-            }
-        }
-    }
-
-    async fn update_workflow_run_snapshot(
-        &self,
-        run_id: &str,
-        snapshot: WorkflowRunSnapshot,
-    ) -> bool {
-        let mut states = self.workflow_run_poll_states.write().await;
-        let state = states.entry(run_id.to_string()).or_default();
-        if state.last_snapshot.as_ref() == Some(&snapshot) {
-            return false;
-        }
-        state.last_snapshot = Some(snapshot);
-        true
-    }
-
-    async fn mark_workflow_run_terminal_emitted(&self, run_id: &str) -> bool {
-        let mut states = self.workflow_run_poll_states.write().await;
-        let state = states.entry(run_id.to_string()).or_default();
-        if state.terminal_emitted {
-            return false;
-        }
-        state.terminal_emitted = true;
-        true
-    }
-
-    async fn finish_workflow_run_poller(&self, run_id: &str) {
-        self.workflow_run_poll_states.write().await.remove(run_id);
-    }
-
-    fn emit_workflow_run_updated(&self, binding: &WorkflowRunBinding, summary: &RunSummary) {
-        self.send_event(ApiEvent::WorkflowRunUpdated {
-            conversation_id: binding.conversation_id.clone(),
-            run_id: summary.run_id.clone(),
-            workflow_id: summary.workflow_id.clone(),
-            status: summary.status.clone(),
-            current_step: summary.current_step.clone(),
-            current_agent: summary.current_agent.clone(),
-            story_done: summary.story_progress.done,
-            story_total: summary.story_progress.total,
-            blocking_reason: run_blocking_reason(&summary.blocking),
-        });
-    }
-
-    fn emit_workflow_run_terminal(&self, binding: &WorkflowRunBinding, result: &FinalRunResult) {
-        match result.status.as_str() {
-            "completed" => {
-                if let Ok(result_value) = serde_json::to_value(result) {
-                    self.send_event(ApiEvent::WorkflowRunCompleted {
-                        conversation_id: binding.conversation_id.clone(),
-                        run_id: result.run_id.clone(),
-                        workflow_id: result.workflow_id.clone(),
-                        result: result_value,
-                    });
-                } else {
-                    tracing::warn!(
-                        run_id = %result.run_id,
-                        "failed to serialize workflow terminal result"
-                    );
-                }
-            }
-            _ => {
-                self.send_event(ApiEvent::WorkflowRunFailed {
-                    conversation_id: binding.conversation_id.clone(),
-                    run_id: result.run_id.clone(),
-                    workflow_id: result.workflow_id.clone(),
-                    status: result.status.clone(),
-                    reason: result.summary.review_decision.clone(),
-                });
-            }
-        }
-    }
-
-    pub async fn ensure_workflow_run_poller(self: &Arc<Self>, run_id: String) {
-        let mut states = self.workflow_run_poll_states.write().await;
-        let state = states.entry(run_id.clone()).or_default();
-        if state.poller_running {
-            return;
-        }
-        state.poller_running = true;
-        drop(states);
-
-        let state = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                interval.tick().await;
-
-                let Some(service) = state.get_antfarm_service().await else {
-                    tracing::warn!(run_id = %run_id, "stopping Antfarm poller because no service is configured");
-                    state.finish_workflow_run_poller(&run_id).await;
-                    break;
-                };
-
-                let Some(binding) = state.get_workflow_run_binding(&run_id).await else {
-                    tracing::debug!(run_id = %run_id, "stopping Antfarm poller because run binding is gone");
-                    state.finish_workflow_run_poller(&run_id).await;
-                    break;
-                };
-
-                match service.get_run_summary(&run_id).await {
-                    Ok(summary) => {
-                        let snapshot = run_snapshot(&summary);
-                        if state.update_workflow_run_snapshot(&run_id, snapshot).await {
-                            state.emit_workflow_run_updated(&binding, &summary);
-                        }
-
-                        if is_terminal_run_status(&summary.status) {
-                            match service.get_final_run_result(&run_id).await {
-                                Ok(Some(result)) => {
-                                    if state.mark_workflow_run_terminal_emitted(&run_id).await {
-                                        state.emit_workflow_run_terminal(&binding, &result);
-                                    }
-                                    state.finish_workflow_run_poller(&run_id).await;
-                                    break;
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %error,
-                                        run_id = %run_id,
-                                        "failed to fetch Antfarm terminal result during poll"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, run_id = %run_id, "Antfarm poller failed to fetch run summary");
-                    }
-                }
-            }
-        });
     }
 
     /// Set the agent links for the communication graph.

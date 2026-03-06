@@ -1,58 +1,53 @@
-# Agent Team 主文档
+# Agent Team 主文档（重建版）
 
-## 1. 当前目标（2026-03）
+## 1. 当前目标
 
-当前目标已经从“主链是否可跑”切换为“主链是否可稳定重复运行”。
+当前唯一目标：以 `Spacebot-only` 路线稳定交付可重复闭环。
 
-具体目标：
+执行顺序：
 
-1. 在权限分离模型下，让 `feature-dev` 可重复 unattended 跑到 terminal
-2. 降低对人工恢复动作（尤其 `kickstart`）的依赖
-3. 在稳定性达标后，进入结果输出契约收敛
-4. 基于稳定基线，落地多仓 Web 闭环流程（4 库 + 测试）
+1. 跑通单仓闭环
+2. 连续 3 次稳定通过
+3. 扩展到 4 仓串行闭环
+4. 再评估是否需要恢复编排底座
 
-## 2. 架构基线
+## 2. 当前架构基线
 
-核心架构不变：
+主链仅保留：
 
-1. `Spacebot`：统一前台入口、任务触发、状态摘要与结果展示
-2. `Antfarm`：工作流编排
-3. `OpenClaw`：执行底座
+1. `Spacebot`
 
-说明：
+边界约束：
 
-- `Spacebot` 用来解决“前台可持续对话 + 后台异步施工”
-- `Antfarm Dashboard` 是辅助调试视图，不是主入口
+1. 成功标准是“闭环可交付”，不是“平台完整度”
+2. 质量控制依赖阶段 Gate，不依赖复杂调度系统
+3. 优先减少系统边界与联调变量
 
 ## 3. 文档地图
 
-后续请按分文档维护，不再把所有内容堆进单一 runbook。
-
-1. 架构与原则
-   - [agile_agent_team_architecture.md](../agile_agent_team_architecture.md)
-2. 部署、联调、运行排障
-   - [deployment_and_integration_runbook.md](../deployment_and_integration_runbook.md)
-3. 推进过程与关键节点（阶段记录）
+1. 路线与原则：
+   - [spacebot_only_direction.md](./spacebot_only_direction.md)
+2. 推进记录：
    - [progress.md](./progress.md)
-4. 当前多仓闭环流程（4 库 + 测试）
+3. 4 仓闭环流程：
    - [workflow_web_4repos.md](./workflow_web_4repos.md)
+   - [workflow_web_4repos_checklist.md](./workflow_web_4repos_checklist.md)
+   - [workflow_web_4repos_checklist.aicoin_web.md](./workflow_web_4repos_checklist.aicoin_web.md)
+4. 单仓闭环执行手册：
+   - [single_repo_closure.md](./single_repo_closure.md)
+5. 部署与运行手册：
+   - [deployment_and_integration_runbook.md](../deployment_and_integration_runbook.md)
 
-## 4. 当前执行顺序
+## 4. 阶段门槛
 
-1. 基于稳定性门槛达标，进入 terminal 输出契约收敛
-2. 并行保留低频 unattended soak 监控（防回归）
-3. 基于契约稳定版，推进多仓闭环 workflow
-4. 稳定后再考虑分工流程扩展（如 `feature-dev-split`）
+进入“4 仓 + 测试”前必须满足：
 
-## 5. 阶段门槛
+1. 单仓闭环连续通过 3 次
+2. 每个阶段有机械可判断 Gate
+3. 失败能定位到明确阶段并可人工恢复
 
-进入“输出契约收敛”前，至少满足：
+## 5. 当前状态
 
-1. 连续 3 次 unattended run 到 terminal
-2. 无需人工 `step claim`
-3. 不依赖每轮 `kickstart` 才能推进
-4. `Spacebot` 面板能稳定展示 terminal 结果
+更新时间：2026-03-06。
 
-当前状态（2026-03-04）：
-
-- 该门槛已由 `#17 / #18 / #19` 达成，可进入“输出契约收敛”阶段。
+状态：已进入 `Spacebot-only` 重建阶段，单仓闭环已累计 3 次稳定通过，下一步切换 4 仓串行闭环。

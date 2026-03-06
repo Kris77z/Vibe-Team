@@ -52,6 +52,11 @@ run_step() {
 	"$@"
 }
 
+# Prefer rustup-managed toolchain when available so cargo/rustc stay in sync.
+if [[ -x "$HOME/.cargo/bin/cargo" && -x "$HOME/.cargo/bin/rustc" ]]; then
+	export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
 resolve_migration_diff_range() {
 	local base_ref=""
 	local head_sha=""
@@ -119,7 +124,7 @@ check_migration_safety() {
 		return
 	fi
 
-	declare -A paths_with_add=()
+	local -a paths_with_add=()
 	for line in "${migration_changes[@]}"; do
 		local status=""
 		local path=""
@@ -132,7 +137,7 @@ check_migration_safety() {
 			[[ "$path" == "$line" ]] && path=""
 		fi
 		if [[ -n "$path" && "$status" == A* ]]; then
-			paths_with_add["$path"]=1
+			paths_with_add+=("$path")
 		fi
 	done
 
@@ -148,7 +153,16 @@ check_migration_safety() {
 			path="${line#* }"
 			[[ "$path" == "$line" ]] && path=""
 		fi
-		if [[ -n "$path" && "$status" != A* && -z "${paths_with_add[$path]:-}" ]]; then
+		local has_add_for_path=false
+		local add_path=""
+		for add_path in "${paths_with_add[@]}"; do
+			if [[ "$add_path" == "$path" ]]; then
+				has_add_for_path=true
+				break
+			fi
+		done
+
+		if [[ -n "$path" && "$status" != A* && "$has_add_for_path" == false ]]; then
 			violations+=("$line")
 		fi
 	done

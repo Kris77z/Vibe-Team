@@ -1,85 +1,78 @@
-# 多仓 Web 闭环流程（4 库 + 测试）
+# 多仓 Web 闭环流程（4 仓 + 测试，重建版）
 
 ## 1. 目标
 
-当前阶段只要求先跑通一条“可交付闭环”流程，不追求角色数量和并行度最大化。
-
-闭环定义：
-
-1. 数据采集库
-2. 数据公共库
-3. 接口库（读取公共库）
-4. 前端库
-5. 测试环节（作为 terminal gate）
-
-## 2. 仓库职责
+在 `Spacebot-only` 主链下，跑通一条可重复的 4 仓串行闭环：
 
 1. `collector-repo`
-   - 负责采集逻辑与原始数据处理
 2. `shared-data-repo`
-   - 负责公共数据模型、公共转换逻辑、共享产物
 3. `api-repo`
-   - 负责服务接口，读取/依赖公共库
 4. `frontend-repo`
-   - 负责页面、交互、接口消费
+5. `integration-test`
 
-每个仓库独立配置（路径、分支、命令、凭据策略）。
-
-## 3. 当前推荐流水线（串行）
+## 2. 执行顺序
 
 ```text
-collector
--> shared-data
--> api
--> frontend
--> integration-test
--> review/summary
+collector -> shared-data -> api -> frontend -> integration-test -> summary
 ```
 
-说明：
+默认串行，先稳后快。
 
-1. 先串行，降低跨仓返工和排障复杂度
-2. 跑稳后再评估有限并行（例如 `api/frontend` 的部分并行）
+## 3. 每仓输入
 
-## 4. 最小输入契约（建议）
+每仓至少要有：
 
-建议在任务触发时显式提供：
+1. 绝对路径
+2. 目标分支
+3. 构建命令
+4. 测试命令
+5. 通过标准
 
-1. `REPO_COLLECTOR`
-2. `REPO_SHARED`
-3. `REPO_API`
-4. `REPO_FE`
-5. `BRANCH_COLLECTOR`
-6. `BRANCH_SHARED`
-7. `BRANCH_API`
-8. `BRANCH_FE`
-9. `BUILD_CMD_*`
-10. `TEST_CMD_*`
+推荐先填写：
+[workflow_web_4repos_checklist.md](./workflow_web_4repos_checklist.md)
 
-最小要求：
+推荐执行器：
+`/Users/applychart/Desktop/vibe-team/drafts/run-4repo-closure.sh`
 
-1. 所有 repo path 必须是部署机绝对路径
-2. 分支策略必须提前明确（新建或复用）
-3. 测试 gate 的通过标准必须可机械判断
+## 3.1 流程先行（暂不改业务仓）
 
-## 5. 测试闭环定义
+在你未下达“改具体仓代码”指令前，只做以下动作：
 
-测试阶段至少覆盖：
+1. 固定 5 仓路径、分支、命令
+2. 校验分支与命令可执行性
+3. 先跑非阻塞阶段（必要时跳过已知阻塞仓）
+4. 输出标准化 `SUMMARY.md` 证据
 
-1. 接口可读到公共库产物
-2. 前端可消费接口并渲染关键页面
-3. 核心路径 smoke/E2E 通过
-4. 失败时给出可定位的失败摘要
+约束：流程阶段可推进，但不改业务仓源码。
 
-只有测试 gate 通过，流程才视为完成。
+## 3.2 跳过阶段参数
 
-## 6. 当前不纳入范围
+执行器支持环境变量 `SKIP_STAGES`（逗号分隔）：
 
-本阶段先不做：
+1. 可写 stage name：`collector,shared-data,api,frontend,integration-test`
+2. 也可写 stage key：`collector,shared,api,fe,integration`
+3. 示例：`SKIP_STAGES='collector'`（跳过 `collector`，继续后续阶段）
 
-1. 多仓并行极限优化
-2. 自动发布流水线
-3. 复杂审批流
-4. 全自动零人工治理
+## 4. 阶段 Gate
 
-先把“稳定可重复闭环”跑稳，再扩展能力。
+1. Collector Gate
+   - 契约产出齐全（字段/类型/样例/错误码）
+2. Shared Gate
+   - 公共模型与转换结果可被 API 仓读取
+3. API Gate
+   - 契约测试通过，错误处理符合约定
+4. FE Gate
+   - 关键页面渲染与核心交互 smoke 通过
+5. Integration Gate
+   - 端到端关键路径通过
+
+## 5. 失败处理
+
+1. 失败即停在当前阶段
+2. 标记失败仓与失败步骤
+3. 给出可复现命令与错误摘要
+4. 修复后从失败阶段重跑，不回滚已通过阶段
+
+## 6. 完成定义
+
+只有 `integration-test` Gate 通过，且存在完整 summary，才算本轮闭环完成。

@@ -40,6 +40,14 @@ export interface OutboundMessageEvent {
 	text: string;
 }
 
+export interface OutboundMessageDeltaEvent {
+	type: "outbound_message_delta";
+	agent_id: string;
+	channel_id: string;
+	text_delta: string;
+	aggregated_text: string;
+}
+
 export interface TypingStateEvent {
 	type: "typing_state";
 	agent_id: string;
@@ -54,6 +62,7 @@ export interface WorkerStartedEvent {
 	worker_id: string;
 	task: string;
 	worker_type?: string;
+	interactive?: boolean;
 }
 
 export interface WorkerStatusEvent {
@@ -62,6 +71,13 @@ export interface WorkerStatusEvent {
 	channel_id: string | null;
 	worker_id: string;
 	status: string;
+}
+
+export interface WorkerIdleEvent {
+	type: "worker_idle";
+	agent_id: string;
+	channel_id: string | null;
+	worker_id: string;
 }
 
 export interface WorkerCompletedEvent {
@@ -109,128 +125,41 @@ export interface ToolCompletedEvent {
 	result: string;
 }
 
-export interface WorkflowRunStartedEvent {
-	type: "workflow_run_started";
-	conversation_id: string;
-	run_id: string;
-	workflow_id: string;
-	status: string;
-	run_number?: number | null;
-}
+// -- OpenCode live transcript part types --
 
-export interface WorkflowRunUpdatedEvent {
-	type: "workflow_run_updated";
-	conversation_id: string;
-	run_id: string;
-	workflow_id: string;
-	status: string;
-	current_step?: string | null;
-	current_agent?: string | null;
-	story_done: number;
-	story_total: number;
-	blocking_reason?: string | null;
-}
+export type OpenCodeToolState =
+	| { status: "pending" }
+	| { status: "running"; title?: string; input?: string }
+	| { status: "completed"; title?: string; input?: string; output?: string }
+	| { status: "error"; error?: string };
 
-export interface WorkflowRunCompletedEvent {
-	type: "workflow_run_completed";
-	conversation_id: string;
-	run_id: string;
-	workflow_id: string;
-	result: {
-		run_id: string;
-		workflow_id: string;
-		status: string;
-		summary: {
-			task: string;
-			changes: string;
-			tests: string;
-			review_decision: string;
-		};
-		artifacts: {
-			branch?: string | null;
-			pr_url?: string | null;
-			commit_range?: string | null;
-		};
-		handoff: {
-			needs_human_acceptance: boolean;
-			open_questions: string[];
-		};
-	};
-}
+export type OpenCodePart =
+	| { type: "text"; id: string; text: string }
+	| { type: "tool"; id: string; tool: string } & OpenCodeToolState
+	| { type: "step_start"; id: string }
+	| { type: "step_finish"; id: string; reason?: string };
 
-export interface WorkflowRunFailedEvent {
-	type: "workflow_run_failed";
-	conversation_id: string;
-	run_id: string;
-	workflow_id: string;
-	status: string;
-	reason: string;
-}
-
-export interface ConversationWorkflowRun {
-	conversation_id: string;
-	run_id: string;
-	workflow_id: string;
-	status: string;
-	current_step?: string | null;
-	current_agent?: string | null;
-	story_done: number;
-	story_total: number;
-	blocking_reason?: string | null;
-	result_summary?: string | null;
-	changes?: string | null;
-	tests?: string | null;
-	review_decision?: string | null;
-	branch?: string | null;
-	pr_url?: string | null;
-	needs_human_acceptance?: boolean;
-	open_questions?: string[];
-	is_terminal: boolean;
-}
-
-export interface ConversationWorkflowRunsResponse {
-	runs: ConversationWorkflowRun[];
-}
-
-export interface CreateAntfarmRunRequest {
-	request_id: string;
-	conversation_id: string;
-	workflow_id: string;
-	task_title: string;
-	task_body: string;
-	repo_path?: string;
-	branch?: string;
-	worktree_path?: string;
-	metadata?: Record<string, string>;
-}
-
-export interface CreateAntfarmRunResponse {
-	ok: boolean;
-	run: {
-		ok: boolean;
-		run_id: string;
-		workflow_id: string;
-		status: string;
-		accepted_at: string;
-		run_number?: number | null;
-	};
+export interface OpenCodePartUpdatedEvent {
+	type: "opencode_part_updated";
+	agent_id: string;
+	worker_id: string;
+	part: OpenCodePart;
 }
 
 export type ApiEvent =
 	| InboundMessageEvent
 	| OutboundMessageEvent
+	| OutboundMessageDeltaEvent
 	| TypingStateEvent
 	| WorkerStartedEvent
 	| WorkerStatusEvent
+	| WorkerIdleEvent
 	| WorkerCompletedEvent
 	| BranchStartedEvent
 	| BranchCompletedEvent
 	| ToolStartedEvent
 	| ToolCompletedEvent
-	| WorkflowRunStartedEvent
-	| WorkflowRunUpdatedEvent
-	| WorkflowRunCompletedEvent
-	| WorkflowRunFailedEvent;
+	| OpenCodePartUpdatedEvent;
 
 async function fetchJson<T>(path: string): Promise<T> {
 	const response = await fetch(`${API_BASE}${path}`);
@@ -283,6 +212,7 @@ export interface WorkerStatusInfo {
 	started_at: string;
 	notify_on_complete: boolean;
 	tool_calls: number;
+	interactive: boolean;
 }
 
 export interface BranchStatusInfo {
@@ -330,6 +260,8 @@ export interface WorkerRunInfo {
 	has_transcript: boolean;
 	live_status: string | null;
 	tool_calls: number;
+	opencode_port: number | null;
+	interactive: boolean;
 }
 
 export interface WorkerDetailResponse {
@@ -344,6 +276,9 @@ export interface WorkerDetailResponse {
 	completed_at: string | null;
 	transcript: TranscriptStep[] | null;
 	tool_calls: number;
+	opencode_session_id: string | null;
+	opencode_port: number | null;
+	interactive: boolean;
 }
 
 export interface WorkerListResponse {
@@ -675,6 +610,12 @@ export interface BrowserSection {
 	enabled: boolean;
 	headless: boolean;
 	evaluate_enabled: boolean;
+	persist_session: boolean;
+	close_policy: "close_browser" | "close_tabs" | "detach";
+}
+
+export interface ChannelSection {
+	listen_only_mode: boolean;
 }
 
 export interface SandboxSection {
@@ -695,6 +636,7 @@ export interface AgentConfigResponse {
 	coalesce: CoalesceSection;
 	memory_persistence: MemoryPersistenceSection;
 	browser: BrowserSection;
+	channel: ChannelSection;
 	discord: DiscordSection;
 	sandbox: SandboxSection;
 }
@@ -757,6 +699,12 @@ export interface BrowserUpdate {
 	enabled?: boolean;
 	headless?: boolean;
 	evaluate_enabled?: boolean;
+	persist_session?: boolean;
+	close_policy?: "close_browser" | "close_tabs" | "detach";
+}
+
+export interface ChannelUpdate {
+	listen_only_mode?: boolean;
 }
 
 export interface SandboxUpdate {
@@ -777,6 +725,7 @@ export interface AgentConfigUpdateRequest {
 	coalesce?: CoalesceUpdate;
 	memory_persistence?: MemoryPersistenceUpdate;
 	browser?: BrowserUpdate;
+	channel?: ChannelUpdate;
 	discord?: DiscordUpdate;
 	sandbox?: SandboxUpdate;
 }
@@ -2055,22 +2004,6 @@ export const api = {
 
 	webChatHistory: (agentId: string, sessionId: string, limit = 100) =>
 		fetch(`${API_BASE}/webchat/history?agent_id=${encodeURIComponent(agentId)}&session_id=${encodeURIComponent(sessionId)}&limit=${limit}`),
-	createAntfarmRun: async (
-		request: CreateAntfarmRunRequest,
-	): Promise<CreateAntfarmRunResponse> => {
-		const response = await fetch(`${API_BASE}/antfarm/runs`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(request),
-		});
-		if (!response.ok) {
-			const body = await response.json().catch(() => ({}));
-			throw new Error(body.error || `API error: ${response.status}`);
-		}
-		return response.json() as Promise<CreateAntfarmRunResponse>;
-	},
-	antfarmConversationRuns: (conversationId: string) =>
-		fetchJson<ConversationWorkflowRunsResponse>(`/antfarm/conversations/${encodeURIComponent(conversationId)}/runs`),
 
 	// Tasks API
 	listTasks: (agentId: string, params?: { status?: TaskStatus; priority?: TaskPriority; limit?: number }) => {

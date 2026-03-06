@@ -55,6 +55,7 @@ Conditionally added:
 |------|-----------|
 | `browser` | When `browser.enabled = true` in agent config |
 | `web_search` | When a Brave Search API key is configured |
+| `mcp_*` | One tool per connected MCP server tool, fetched at worker start |
 
 Workers don't get memory tools, channel tools, or branch tools. They can't talk to the user, recall memories, or spawn other processes. They execute their task and report status.
 
@@ -153,7 +154,7 @@ Worker shell and exec commands run inside an OS-level sandbox (bubblewrap on Lin
 
 The agent's data directory (databases, config files) is explicitly re-mounted read-only. This is enforced at the kernel level -- no amount of command creativity can bypass it.
 
-Worker subprocesses also start with a **clean environment**. Workers only receive `PATH` (with `tools/bin` prepended), safe variables (`HOME`, `USER`, `LANG`, `TERM`, `TMPDIR`), tool-category secrets from the [secret store](/docs/secrets), and any explicitly configured `passthrough_env` entries. System secrets like LLM API keys are hidden by default unless explicitly forwarded via `passthrough_env`. Environment sanitization applies regardless of whether the sandbox is enabled or disabled.
+Worker subprocesses also start with a **clean environment**. Workers only receive `PATH` (with `tools/bin` prepended), safe variables (`HOME`, `USER`, `LANG`, `TERM`, `TMPDIR`), tool-category secrets from the [secret store](/docs/secrets), and any explicitly configured `passthrough_env` entries. `HOME` is mode-dependent: workspace path when sandboxed, parent `HOME` in passthrough mode. System secrets like LLM API keys are hidden by default unless explicitly forwarded via `passthrough_env`. Environment sanitization applies regardless of whether the sandbox is enabled or disabled.
 
 The `file` tool validates paths against the workspace boundary and rejects writes to identity/memory paths (for example `SOUL.md`, `IDENTITY.md`, `USER.md`) with an explicit error directing the LLM to the appropriate tool. The `exec` tool blocks dangerous environment variables (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, etc.) that enable library injection.
 

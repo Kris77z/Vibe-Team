@@ -1,41 +1,9 @@
 import { createContext, useContext, useCallback, useRef, useState, useMemo, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-	api,
-	type AgentMessageEvent,
-	type ChannelInfo,
-	type ToolStartedEvent,
-	type ToolCompletedEvent,
-	type WorkerStatusEvent,
-	type TranscriptStep,
-	type WorkflowRunCompletedEvent,
-	type WorkflowRunFailedEvent,
-	type WorkflowRunStartedEvent,
-	type WorkflowRunUpdatedEvent,
-} from "@/api/client";
+import { api, type AgentMessageEvent, type ChannelInfo, type ToolStartedEvent, type ToolCompletedEvent, type WorkerStatusEvent, type TranscriptStep, type OpenCodePart, type OpenCodePartUpdatedEvent } from "@/api/client";
+import { generateId } from "@/lib/id";
 import { useEventSource, type ConnectionState } from "@/hooks/useEventSource";
 import { useChannelLiveState, type ChannelLiveState, type ActiveWorker } from "@/hooks/useChannelLiveState";
-
-export interface WorkflowRunState {
-	runId: string;
-	workflowId: string;
-	status: string;
-	runNumber?: number | null;
-	currentStep: string | null;
-	currentAgent: string | null;
-	storyDone: number;
-	storyTotal: number;
-	blockingReason: string | null;
-	resultSummary: string | null;
-	changes: string | null;
-	tests: string | null;
-	reviewDecision: string | null;
-	branch: string | null;
-	prUrl: string | null;
-	needsHumanAcceptance: boolean;
-	openQuestions: string[];
-	isTerminal: boolean;
-}
 
 interface LiveContextValue {
 	liveStates: Record<string, ChannelLiveState>;
@@ -53,9 +21,8 @@ interface LiveContextValue {
 	taskEventVersion: number;
 	/** Live transcript steps for running workers, keyed by worker_id. Built from SSE tool events. */
 	liveTranscripts: Record<string, TranscriptStep[]>;
-	/** Workflow runs keyed by conversation/session id. */
-	workflowRunsByConversation: Record<string, WorkflowRunState[]>;
-	hydrateWorkflowRuns: (conversationId: string, runs: WorkflowRunState[]) => void;
+	/** Live OpenCode parts for running workers, keyed by worker_id. Parts are insertion-ordered Maps keyed by part ID. */
+	liveOpenCodeParts: Record<string, Map<string, OpenCodePart>>;
 }
 
 const LiveContext = createContext<LiveContextValue>({
@@ -69,8 +36,7 @@ const LiveContext = createContext<LiveContextValue>({
 	workerEventVersion: 0,
 	taskEventVersion: 0,
 	liveTranscripts: {},
-	workflowRunsByConversation: {},
-	hydrateWorkflowRuns: () => {},
+	liveOpenCodeParts: {},
 });
 
 export function useLiveContext() {
@@ -104,7 +70,10 @@ export function LiveContextProvider({ children }: { children: ReactNode }) {
 	// Live transcript accumulator: builds TranscriptStep[] from SSE tool events
 	// for running workers. Cleared when worker completes.
 	const [liveTranscripts, setLiveTranscripts] = useState<Record<string, TranscriptStep[]>>({});
-	const [workflowRunsByConversation, setWorkflowRunsByConversation] = useState<Record<string, WorkflowRunState[]>>({});
+
+	// Live OpenCode parts: per-worker insertion-ordered Map keyed by part ID.
+	// Updated via opencode_part_updated SSE events. Cleared when worker completes.
+	const [liveOpenCodeParts, setLiveOpenCodeParts] = useState<Record<string, Map<string, OpenCodePart>>>({});
 
 	// Derive flat active workers from channel live states
 	const pendingToolCallIdsRef = useRef<Record<string, Record<string, string[]>>>({});
@@ -171,6 +140,7 @@ export function LiveContextProvider({ children }: { children: ReactNode }) {
 		channelHandlers.worker_started(data);
 		const event = data as { worker_id: string };
 		setLiveTranscripts((prev) => ({ ...prev, [event.worker_id]: [] }));
+		setLiveOpenCodeParts((prev) => ({ ...prev, [event.worker_id]: new Map() }));
 		delete pendingToolCallIdsRef.current[event.worker_id];
 		bumpWorkerVersion();
 	}, [channelHandlers, bumpWorkerVersion]);
@@ -192,10 +162,21 @@ export function LiveContextProvider({ children }: { children: ReactNode }) {
 		bumpWorkerVersion();
 	}, [channelHandlers, bumpWorkerVersion]);
 
+	const wrappedWorkerIdle = useCallback((data: unknown) => {
+		channelHandlers.worker_idle(data);
+		bumpWorkerVersion();
+	}, [channelHandlers, bumpWorkerVersion]);
+
 	const wrappedWorkerCompleted = useCallback((data: unknown) => {
 		channelHandlers.worker_completed(data);
 		const event = data as { worker_id: string };
 		delete pendingToolCallIdsRef.current[event.worker_id];
+		// Clean up live OpenCode parts — persisted transcript takes over
+		setLiveOpenCodeParts((prev) => {
+			const next = { ...prev };
+			delete next[event.worker_id];
+			return next;
+		});
 		bumpWorkerVersion();
 	}, [channelHandlers, bumpWorkerVersion]);
 
@@ -203,7 +184,7 @@ export function LiveContextProvider({ children }: { children: ReactNode }) {
 		channelHandlers.tool_started(data);
 		const event = data as ToolStartedEvent;
 		if (event.process_type === "worker") {
-			const callId = crypto.randomUUID();
+			const callId = generateId();
 			const pendingByTool = pendingToolCallIdsRef.current[event.process_id] ?? {};
 			const queue = pendingByTool[event.tool_name] ?? [];
 			pendingByTool[event.tool_name] = [...queue, callId];
@@ -256,137 +237,17 @@ export function LiveContextProvider({ children }: { children: ReactNode }) {
 		}
 	}, [channelHandlers, bumpWorkerVersion]);
 
-	const upsertWorkflowRun = useCallback((conversationId: string, nextRun: WorkflowRunState) => {
-		setWorkflowRunsByConversation((prev) => {
-			const existing = prev[conversationId] ?? [];
-			const next = existing.some((run) => run.runId === nextRun.runId)
-				? existing.map((run) => (run.runId === nextRun.runId ? { ...run, ...nextRun } : run))
-				: [nextRun, ...existing];
-			return {
-				...prev,
-				[conversationId]: next.sort((a, b) => {
-					const aRank = a.isTerminal ? 1 : 0;
-					const bRank = b.isTerminal ? 1 : 0;
-					if (aRank !== bRank) return aRank - bRank;
-					return (b.runNumber ?? 0) - (a.runNumber ?? 0);
-				}),
-			};
+	// Handle OpenCode part updates — upsert parts into the per-worker ordered map
+	const handleOpenCodePartUpdated = useCallback((data: unknown) => {
+		const event = data as OpenCodePartUpdatedEvent;
+		setLiveOpenCodeParts((prev) => {
+			const existing = prev[event.worker_id] ?? new Map<string, OpenCodePart>();
+			const next = new Map(existing);
+			next.set(event.part.id, event.part);
+			return { ...prev, [event.worker_id]: next };
 		});
-	}, []);
-
-	const hydrateWorkflowRuns = useCallback((conversationId: string, runs: WorkflowRunState[]) => {
-		setWorkflowRunsByConversation((prev) => {
-			const existing = prev[conversationId] ?? [];
-			const merged = new Map<string, WorkflowRunState>();
-			for (const run of existing) merged.set(run.runId, run);
-			for (const run of runs) {
-				const current = merged.get(run.runId);
-				merged.set(run.runId, current ? { ...current, ...run } : run);
-			}
-			return {
-				...prev,
-				[conversationId]: Array.from(merged.values()).sort((a, b) => {
-					const aRank = a.isTerminal ? 1 : 0;
-					const bRank = b.isTerminal ? 1 : 0;
-					if (aRank !== bRank) return aRank - bRank;
-					return (b.runNumber ?? 0) - (a.runNumber ?? 0);
-				}),
-			};
-		});
-	}, []);
-
-	const handleWorkflowRunStarted = useCallback((data: unknown) => {
-		const event = data as WorkflowRunStartedEvent;
-		upsertWorkflowRun(event.conversation_id, {
-			runId: event.run_id,
-			workflowId: event.workflow_id,
-			status: event.status,
-			runNumber: event.run_number ?? null,
-			currentStep: null,
-			currentAgent: null,
-			storyDone: 0,
-			storyTotal: 0,
-			blockingReason: null,
-			resultSummary: null,
-			changes: null,
-			tests: null,
-			reviewDecision: null,
-			branch: null,
-			prUrl: null,
-			needsHumanAcceptance: false,
-			openQuestions: [],
-			isTerminal: false,
-		});
-	}, [upsertWorkflowRun]);
-
-	const handleWorkflowRunUpdated = useCallback((data: unknown) => {
-		const event = data as WorkflowRunUpdatedEvent;
-		upsertWorkflowRun(event.conversation_id, {
-			runId: event.run_id,
-			workflowId: event.workflow_id,
-			status: event.status,
-			currentStep: event.current_step ?? null,
-			currentAgent: event.current_agent ?? null,
-			storyDone: event.story_done,
-			storyTotal: event.story_total,
-			blockingReason: event.blocking_reason ?? null,
-			resultSummary: null,
-			changes: null,
-			tests: null,
-			reviewDecision: null,
-			branch: null,
-			prUrl: null,
-			needsHumanAcceptance: false,
-			openQuestions: [],
-			isTerminal: false,
-		});
-	}, [upsertWorkflowRun]);
-
-	const handleWorkflowRunCompleted = useCallback((data: unknown) => {
-		const event = data as WorkflowRunCompletedEvent;
-		upsertWorkflowRun(event.conversation_id, {
-			runId: event.run_id,
-			workflowId: event.workflow_id,
-			status: event.result.status,
-			currentStep: null,
-			currentAgent: null,
-			storyDone: 0,
-			storyTotal: 0,
-			blockingReason: null,
-			resultSummary: event.result.summary.changes || event.result.summary.tests || event.result.summary.review_decision,
-			changes: event.result.summary.changes || null,
-			tests: event.result.summary.tests || null,
-			reviewDecision: event.result.summary.review_decision || null,
-			branch: event.result.artifacts.branch ?? null,
-			prUrl: event.result.artifacts.pr_url ?? null,
-			needsHumanAcceptance: event.result.handoff.needs_human_acceptance,
-			openQuestions: event.result.handoff.open_questions,
-			isTerminal: true,
-		});
-	}, [upsertWorkflowRun]);
-
-	const handleWorkflowRunFailed = useCallback((data: unknown) => {
-		const event = data as WorkflowRunFailedEvent;
-		upsertWorkflowRun(event.conversation_id, {
-			runId: event.run_id,
-			workflowId: event.workflow_id,
-			status: event.status,
-			currentStep: null,
-			currentAgent: null,
-			storyDone: 0,
-			storyTotal: 0,
-			blockingReason: event.reason,
-			resultSummary: event.reason,
-			changes: null,
-			tests: null,
-			reviewDecision: null,
-			branch: null,
-			prUrl: null,
-			needsHumanAcceptance: false,
-			openQuestions: [],
-			isTerminal: true,
-		});
-	}, [upsertWorkflowRun]);
+		bumpWorkerVersion();
+	}, [bumpWorkerVersion]);
 
 	// Merge channel handlers with agent message + task handlers
 	const handlers = useMemo(
@@ -394,31 +255,16 @@ export function LiveContextProvider({ children }: { children: ReactNode }) {
 			...channelHandlers,
 			worker_started: wrappedWorkerStarted,
 			worker_status: wrappedWorkerStatus,
+			worker_idle: wrappedWorkerIdle,
 			worker_completed: wrappedWorkerCompleted,
 			tool_started: wrappedToolStarted,
 			tool_completed: wrappedToolCompleted,
+			opencode_part_updated: handleOpenCodePartUpdated,
 			agent_message_sent: handleAgentMessage,
 			agent_message_received: handleAgentMessage,
 			task_updated: bumpTaskVersion,
-			workflow_run_started: handleWorkflowRunStarted,
-			workflow_run_updated: handleWorkflowRunUpdated,
-			workflow_run_completed: handleWorkflowRunCompleted,
-			workflow_run_failed: handleWorkflowRunFailed,
 		}),
-		[
-			channelHandlers,
-			wrappedWorkerStarted,
-			wrappedWorkerStatus,
-			wrappedWorkerCompleted,
-			wrappedToolStarted,
-			wrappedToolCompleted,
-			handleAgentMessage,
-			bumpTaskVersion,
-			handleWorkflowRunStarted,
-			handleWorkflowRunUpdated,
-			handleWorkflowRunCompleted,
-			handleWorkflowRunFailed,
-		],
+		[channelHandlers, wrappedWorkerStarted, wrappedWorkerStatus, wrappedWorkerIdle, wrappedWorkerCompleted, wrappedToolStarted, wrappedToolCompleted, handleOpenCodePartUpdated, handleAgentMessage, bumpTaskVersion],
 	);
 
 	const onReconnect = useCallback(() => {
@@ -440,20 +286,7 @@ export function LiveContextProvider({ children }: { children: ReactNode }) {
 	const hasData = channels.length > 0 || channelsData !== undefined;
 
 	return (
-		<LiveContext.Provider value={{
-			liveStates,
-			channels,
-			connectionState,
-			hasData,
-			loadOlderMessages,
-			activeLinks,
-			activeWorkers,
-			workerEventVersion,
-			taskEventVersion,
-			liveTranscripts,
-			workflowRunsByConversation,
-			hydrateWorkflowRuns,
-		}}>
+		<LiveContext.Provider value={{ liveStates, channels, connectionState, hasData, loadOlderMessages, activeLinks, activeWorkers, workerEventVersion, taskEventVersion, liveTranscripts, liveOpenCodeParts }}>
 			{children}
 		</LiveContext.Provider>
 	);

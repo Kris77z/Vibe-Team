@@ -46,6 +46,11 @@ require_command() {
 	fi
 }
 
+# Prefer rustup-managed toolchain when available so cargo/rustc stay in sync.
+if [[ -x "$HOME/.cargo/bin/cargo" && -x "$HOME/.cargo/bin/rustc" ]]; then
+	export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
 require_command git
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "not inside a git worktree"
 

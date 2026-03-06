@@ -400,8 +400,10 @@ pub(super) async fn trigger_warmup(
         let llm_manager = llm_manager.clone();
         let force = request.force;
         let agent_id = agent_id.clone();
+        let task_store_registry = state.task_store_registry.clone();
+        let injection_tx = state.injection_tx.clone();
         tokio::spawn(async move {
-            let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+            let (event_tx, memory_event_tx) = crate::create_process_event_buses();
             let deps = crate::AgentDeps {
                 agent_id: Arc::from(agent_id.as_str()),
                 memory_search,
@@ -410,12 +412,18 @@ pub(super) async fn trigger_warmup(
                 cron_tool: None,
                 runtime_config,
                 event_tx,
+                memory_event_tx,
                 sqlite_pool: sqlite_pool.clone(),
                 messaging_manager: None,
                 sandbox,
                 task_store,
                 links: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
                 agent_names: Arc::new(std::collections::HashMap::new()),
+                task_store_registry,
+                process_control_registry: Arc::new(
+                    crate::agent::process_control::ProcessControlRegistry::new(),
+                ),
+                injection_tx,
             };
             let logger = CortexLogger::new(sqlite_pool);
             crate::agent::cortex::run_warmup_once(&deps, &logger, "api_trigger", force).await;
@@ -558,6 +566,7 @@ pub(super) async fn create_agent(
         cortex: None,
         warmup: None,
         browser: None,
+        channel: None,
         mcp: None,
         brave_search_key: None,
         cron_timezone: None,
@@ -625,7 +634,7 @@ pub(super) async fn create_agent(
     ));
     let task_store = std::sync::Arc::new(crate::tasks::TaskStore::new(db.sqlite.clone()));
 
-    let (event_tx, _) = tokio::sync::broadcast::channel(256);
+    let (event_tx, memory_event_tx) = crate::create_process_event_buses();
     let arc_agent_id: crate::AgentId = std::sync::Arc::from(agent_id.as_str());
 
     crate::identity::scaffold_identity_files(&agent_config.workspace)
@@ -672,7 +681,8 @@ pub(super) async fn create_agent(
         identity,
         skills,
     ));
-    runtime_config.set_settings(settings_store.clone());
+    let explicit_listen_only = raw_config.channel.map(|channel| channel.listen_only_mode);
+    runtime_config.set_settings(settings_store.clone(), explicit_listen_only);
 
     let llm_manager = {
         let guard = state.llm_manager.read().await;
@@ -707,6 +717,7 @@ pub(super) async fn create_agent(
         cron_tool: None,
         runtime_config: runtime_config.clone(),
         event_tx: event_tx.clone(),
+        memory_event_tx: memory_event_tx.clone(),
         sqlite_pool: db.sqlite.clone(),
         messaging_manager: {
             let guard = state.messaging_manager.read().await;
@@ -716,6 +727,11 @@ pub(super) async fn create_agent(
         links: Arc::new(arc_swap::ArcSwap::from_pointee(
             (**state.agent_links.load()).clone(),
         )),
+        task_store_registry: state.task_store_registry.clone(),
+        process_control_registry: Arc::new(
+            crate::agent::process_control::ProcessControlRegistry::new(),
+        ),
+        injection_tx: state.injection_tx.clone(),
         agent_names: {
             let configs = state.agent_configs.load();
             let mut names: std::collections::HashMap<String, String> = configs
@@ -770,6 +786,7 @@ pub(super) async fn create_agent(
         deps.agent_id.clone(),
         deps.task_store.clone(),
         memory_search.clone(),
+        deps.memory_event_tx.clone(),
         conversation_logger,
         channel_store,
         run_logger,
@@ -778,6 +795,7 @@ pub(super) async fn create_agent(
         brave_search_key,
         runtime_config.workspace_dir.clone(),
         sandbox.clone(),
+        runtime_config.clone(),
     );
     let cortex_store = crate::agent::cortex_chat::CortexChatStore::new(db.sqlite.clone());
     let cortex_session = crate::agent::cortex_chat::CortexChatSession::new(
@@ -788,8 +806,7 @@ pub(super) async fn create_agent(
 
     let cortex_logger = crate::agent::cortex::CortexLogger::new(db.sqlite.clone());
     let _warmup_loop = crate::agent::cortex::spawn_warmup_loop(deps.clone(), cortex_logger.clone());
-    let _bulletin_loop =
-        crate::agent::cortex::spawn_bulletin_loop(deps.clone(), cortex_logger.clone());
+    let _cortex_loop = crate::agent::cortex::spawn_cortex_loop(deps.clone(), cortex_logger.clone());
     let _association_loop =
         crate::agent::cortex::spawn_association_loop(deps.clone(), cortex_logger);
     crate::agent::cortex::spawn_ready_task_loop(
@@ -825,8 +842,14 @@ pub(super) async fn create_agent(
         state.memory_searches.store(std::sync::Arc::new(searches));
 
         let mut task_stores = (**state.task_stores.load()).clone();
-        task_stores.insert(agent_id.clone(), task_store);
+        task_stores.insert(agent_id.clone(), task_store.clone());
         state.task_stores.store(std::sync::Arc::new(task_stores));
+
+        let mut registry = (**state.task_store_registry.load()).clone();
+        registry.insert(agent_id.clone(), task_store);
+        state
+            .task_store_registry
+            .store(std::sync::Arc::new(registry));
 
         let mut workspaces = (**state.agent_workspaces.load()).clone();
         workspaces.insert(agent_id.clone(), agent_config.workspace.clone());
@@ -1478,10 +1501,16 @@ mod tests {
         let (agent_tx, _agent_rx) = tokio::sync::mpsc::channel(1);
         let (agent_remove_tx, _agent_remove_rx) = tokio::sync::mpsc::channel(1);
 
+        let (injection_tx, _injection_rx) = tokio::sync::mpsc::channel(1);
+        let task_store_registry = Arc::new(arc_swap::ArcSwap::from_pointee(
+            std::collections::HashMap::new(),
+        ));
         Arc::new(ApiState::new_with_provider_sender(
             provider_setup_tx,
             agent_tx,
             agent_remove_tx,
+            injection_tx,
+            task_store_registry,
         ))
     }
 

@@ -1,6 +1,6 @@
 //! Memory search: hybrid (vector + FTS + RRF + graph), temporal, importance, and typed queries.
 
-use crate::error::Result;
+use crate::error::{LlmError, Result};
 use crate::memory::types::{Memory, MemorySearchResult, MemoryType, RelationType};
 use crate::memory::{EmbeddingModel, EmbeddingTable, MemoryStore};
 
@@ -37,7 +37,7 @@ pub enum SearchSort {
 pub struct MemorySearch {
     store: Arc<MemoryStore>,
     embedding_table: EmbeddingTable,
-    embedding_model: Arc<EmbeddingModel>,
+    embedding_model: Option<Arc<EmbeddingModel>>,
 }
 
 impl Clone for MemorySearch {
@@ -45,7 +45,7 @@ impl Clone for MemorySearch {
         Self {
             store: Arc::clone(&self.store),
             embedding_table: self.embedding_table.clone(),
-            embedding_model: Arc::clone(&self.embedding_model),
+            embedding_model: self.embedding_model.clone(),
         }
     }
 }
@@ -68,7 +68,17 @@ impl MemorySearch {
         Self {
             store,
             embedding_table,
-            embedding_model,
+            embedding_model: Some(embedding_model),
+        }
+    }
+
+    /// Create a MemorySearch for metadata-only modes (Recent/Important/Typed)
+    /// without requiring an embedding model.
+    pub fn new_metadata_only(store: Arc<MemoryStore>, embedding_table: EmbeddingTable) -> Self {
+        Self {
+            store,
+            embedding_table,
+            embedding_model: None,
         }
     }
 
@@ -84,12 +94,16 @@ impl MemorySearch {
 
     /// Get a reference to the embedding model.
     pub fn embedding_model(&self) -> &EmbeddingModel {
-        &self.embedding_model
+        self.embedding_model
+            .as_deref()
+            .expect("embedding model is not configured for this MemorySearch")
     }
 
     /// Get a shared handle to the embedding model (for async embed_one).
     pub fn embedding_model_arc(&self) -> &Arc<EmbeddingModel> {
-        &self.embedding_model
+        self.embedding_model
+            .as_ref()
+            .expect("embedding model is not configured for this MemorySearch")
     }
 
     /// Unified search entry point. Dispatches to the appropriate strategy
@@ -179,7 +193,12 @@ impl MemorySearch {
         }
 
         // 2. Vector similarity search via LanceDB
-        let query_embedding = self.embedding_model.embed_one(query).await?;
+        let embedding_model = self.embedding_model.as_ref().ok_or_else(|| {
+            crate::Error::from(LlmError::EmbeddingFailed(
+                "embedding model is not configured for hybrid search".to_string(),
+            ))
+        })?;
+        let query_embedding = embedding_model.embed_one(query).await?;
         match self
             .embedding_table
             .vector_search(&query_embedding, config.max_results_per_source)
@@ -564,8 +583,7 @@ mod tests {
             .await
             .unwrap();
         let embedding_table = EmbeddingTable::open_or_create(&lance_conn).await.unwrap();
-        let embedding_model = Arc::new(EmbeddingModel::new(lance_dir.path()).unwrap());
-        let search = MemorySearch::new(store, embedding_table, embedding_model);
+        let search = MemorySearch::new_metadata_only(store, embedding_table);
 
         let config = SearchConfig {
             mode: SearchMode::Recent,
@@ -592,8 +610,7 @@ mod tests {
             .await
             .unwrap();
         let embedding_table = EmbeddingTable::open_or_create(&lance_conn).await.unwrap();
-        let embedding_model = Arc::new(EmbeddingModel::new(lance_dir.path()).unwrap());
-        let search = MemorySearch::new(store, embedding_table, embedding_model);
+        let search = MemorySearch::new_metadata_only(store, embedding_table);
 
         let config = SearchConfig {
             mode: SearchMode::Important,
@@ -617,8 +634,7 @@ mod tests {
             .await
             .unwrap();
         let embedding_table = EmbeddingTable::open_or_create(&lance_conn).await.unwrap();
-        let embedding_model = Arc::new(EmbeddingModel::new(lance_dir.path()).unwrap());
-        let search = MemorySearch::new(store, embedding_table, embedding_model);
+        let search = MemorySearch::new_metadata_only(store, embedding_table);
 
         let config = SearchConfig {
             mode: SearchMode::Typed,
@@ -642,8 +658,7 @@ mod tests {
             .await
             .unwrap();
         let embedding_table = EmbeddingTable::open_or_create(&lance_conn).await.unwrap();
-        let embedding_model = Arc::new(EmbeddingModel::new(lance_dir.path()).unwrap());
-        let search = MemorySearch::new(store, embedding_table, embedding_model);
+        let search = MemorySearch::new_metadata_only(store, embedding_table);
 
         let config = SearchConfig {
             mode: SearchMode::Typed,
